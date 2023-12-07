@@ -132,7 +132,7 @@ public class OmMetadataManagerImpl implements OMMetadataManager,
   /**
    * OM RocksDB Structure .
    * <p>
-   * OM DB stores metadata as KV pairs iThis n different column families.
+   * OM DB stores metadata as KV pairs in n different column families.
    * <p>
    * OM DB Schema:
    *
