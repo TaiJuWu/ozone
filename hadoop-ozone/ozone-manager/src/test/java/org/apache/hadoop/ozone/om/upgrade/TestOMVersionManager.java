@@ -20,9 +20,7 @@ package org.apache.hadoop.ozone.om.upgrade;
 
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.NOT_SUPPORTED_OPERATION;
 import static org.apache.hadoop.ozone.om.upgrade.OMLayoutFeature.INITIAL_VERSION;
-import static org.apache.hadoop.ozone.om.upgrade.OMLayoutVersionManager.OM_REQUEST_CLASS_PACKAGE;
 import static org.apache.hadoop.ozone.om.upgrade.OMLayoutVersionManager.OM_UPGRADE_CLASS_PACKAGE;
-import static org.apache.hadoop.ozone.om.upgrade.OMLayoutVersionManager.getRequestClasses;
 import static org.apache.hadoop.ozone.upgrade.LayoutFeature.UpgradeActionType.VALIDATE_IN_PREFINALIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -35,22 +33,16 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Optional;
-import java.util.Set;
 
 import org.apache.hadoop.ozone.om.OzoneManager;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.request.OMClientRequest;
 import org.apache.hadoop.ozone.upgrade.LayoutFeature.UpgradeActionType;
-import org.apache.ozone.test.UnhealthyTest;
-import org.apache.ozone.test.tag.Unhealthy;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
-import org.junit.experimental.categories.Category;
 
 /**
  * Test OM layout version management.
@@ -103,41 +95,6 @@ public class TestOMVersionManager {
       lastFeature.action(type).get().execute(omMock);
     }
     verify(omMock, times(UpgradeActionType.values().length)).getVersion();
-  }
-
-  @Test
-  @Category(UnhealthyTest.class)
-  @Unhealthy("Since there is no longer a need to enforce the getRequestType " +
-      "method in OM request classes, disabling the " +
-      "test. Potentially revisit later.")
-  public void testAllOMRequestClassesHaveRequestType()
-      throws InvocationTargetException, IllegalAccessException {
-
-    Set<Class<? extends OMClientRequest>> requestClasses =
-        getRequestClasses(OM_REQUEST_CLASS_PACKAGE);
-    Set<String> requestTypes = new HashSet<>();
-
-    for (Class<? extends OMClientRequest> requestClass : requestClasses) {
-      try {
-        Method getRequestTypeMethod = requestClass.getMethod(
-            "getRequestType");
-        String type = (String) getRequestTypeMethod.invoke(null);
-
-        int lVersion = INITIAL_VERSION.layoutVersion();
-        BelongsToLayoutVersion annotation =
-            requestClass.getAnnotation(BelongsToLayoutVersion.class);
-        if (annotation != null) {
-          lVersion = annotation.value().layoutVersion();
-        }
-        if (requestTypes.contains(type + "-" + lVersion)) {
-          Assertions.fail("Duplicate request/version type found : " + type);
-        }
-        requestTypes.add(type + "-" + lVersion);
-      } catch (NoSuchMethodException nsmEx) {
-        Assertions.fail("getRequestType method not defined in a class." +
-            nsmEx.getMessage());
-      }
-    }
   }
 
   @Test

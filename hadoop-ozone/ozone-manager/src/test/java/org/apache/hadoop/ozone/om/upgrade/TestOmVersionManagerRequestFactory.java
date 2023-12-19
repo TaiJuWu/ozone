@@ -21,7 +21,6 @@ package org.apache.hadoop.ozone.om.upgrade;
 import static org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.Type.CreateKey;
 
 import java.lang.reflect.Constructor;
-import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.Set;
 
@@ -72,9 +71,6 @@ public class TestOmVersionManagerRequestFactory {
       if (Modifier.isAbstract(requestClass.getModifiers())) {
         continue;
       }
-      Method getRequestTypeMethod = requestClass.getMethod(
-          "getRequestType");
-      Assertions.assertNotNull(getRequestTypeMethod);
 
       Constructor<? extends OMClientRequest> constructorWithOmRequestArg =
           requestClass.getDeclaredConstructor(OMRequest.class);
