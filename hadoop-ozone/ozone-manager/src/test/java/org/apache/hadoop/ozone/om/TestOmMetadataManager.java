@@ -146,7 +146,7 @@ public class TestOmMetadataManager {
     String startVolume = "vol" + startOrder;
     List<OmVolumeArgs> volumeList = omMetadataManager.listVolumes(ownerName,
         prefix, startVolume, 100);
-    assertEquals(volumeList.size(), totalVol - startOrder - 1);
+    assertEquals(volumeList.size(), totalVol - startOrder);
   }
 
   @Test

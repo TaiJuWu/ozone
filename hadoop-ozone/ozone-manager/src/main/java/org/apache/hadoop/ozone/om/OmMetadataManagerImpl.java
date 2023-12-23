@@ -1423,8 +1423,8 @@ public class OmMetadataManagerImpl implements OMMetadataManager,
           startKey.substring(1) :
           startKey);
 
-      // Exclude the startVolume as part of the result.
-      index = index != -1 ? index + 1 : index;
+//      // Exclude the startVolume as part of the result.
+//      index = index != -1 ? index + 1 : index; // tricky
     }
     final String startChar = prefix == null ? "" : prefix;
 
