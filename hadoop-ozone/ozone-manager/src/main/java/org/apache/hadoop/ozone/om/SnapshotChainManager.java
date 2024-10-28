@@ -72,7 +72,17 @@ public final class SnapshotChainManager {
   }
 
   public synchronized void init(OMMetadataManager metadataManager) {
+    clear();
     snapshotChainCorrupted = !loadFromSnapshotInfoTable(metadataManager);
+  }
+
+  public synchronized void clear() {
+    globalSnapshotChain.clear();
+    snapshotChainByPath.clear();
+    latestSnapshotIdByPath.clear();
+    snapshotIdToTableKey.clear();
+    latestGlobalSnapshotId = null;
+    oldestGlobalSnapshotId = null;
   }
 
   /**
