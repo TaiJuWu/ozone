@@ -76,7 +76,8 @@ public class TestSnapshotChain {
     conf.set(OZONE_OM_DB_DIRS, folder.toString());
     omMetadataManager = new OmMetadataManagerImpl(conf, null);
     snapshotIdToSnapshotInfoMap = new HashMap<>();
-    chainManager = new SnapshotChainManager(omMetadataManager);
+    chainManager = SnapshotChainManager.getInstance();
+    chainManager.init(omMetadataManager);
   }
 
   private SnapshotInfo createSnapshotInfo(UUID snapshotID,
@@ -284,7 +285,8 @@ public class TestSnapshotChain {
       snapshotInfoList.add(snapInfo);
     }
 
-    chainManager = new SnapshotChainManager(omMetadataManager);
+    chainManager = SnapshotChainManager.getInstance();
+    chainManager.init(omMetadataManager);
     assertFalse(chainManager.isSnapshotChainCorrupted());
     // check if snapshots loaded correctly from snapshotInfoTable
     assertEquals(snapshotID2, chainManager.getLatestGlobalSnapshotId());
@@ -325,7 +327,8 @@ public class TestSnapshotChain {
       prevSnapshotID = snapshotID;
       snapshotInfoList.add(snapInfo);
     }
-    chainManager = new SnapshotChainManager(omMetadataManager);
+    chainManager = SnapshotChainManager.getInstance();
+    chainManager.init(omMetadataManager);
     assertFalse(chainManager.isSnapshotChainCorrupted());
     List<UUID> reverseChain = Lists.newArrayList(chainManager.iterator(true));
     Collections.reverse(reverseChain);
@@ -380,7 +383,8 @@ public class TestSnapshotChain {
           createSnapshotInfo(snapshotID, snapshotChain.get(snapshotID),
               snapshotChain.get(snapshotID), System.currentTimeMillis()));
     }
-    chainManager = new SnapshotChainManager(omMetadataManager);
+    chainManager = SnapshotChainManager.getInstance();
+    chainManager.init(omMetadataManager);
 
     assertTrue(chainManager.isSnapshotChainCorrupted());
 
@@ -414,7 +418,8 @@ public class TestSnapshotChain {
               prevSnapshotId, System.currentTimeMillis()));
       prevSnapshotId = snapshotID;
     }
-    chainManager = new SnapshotChainManager(omMetadataManager);
+    chainManager = SnapshotChainManager.getInstance();
+    chainManager.init(omMetadataManager);
     assertTrue(chainManager.isSnapshotChainCorrupted());
 
     SnapshotInfo snapInfo = createSnapshotInfo(UUID.randomUUID(),

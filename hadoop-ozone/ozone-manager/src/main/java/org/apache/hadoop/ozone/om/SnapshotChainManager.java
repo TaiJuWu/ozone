@@ -47,25 +47,31 @@ import java.util.concurrent.ConcurrentMap;
  * On start, the snapshot chains are initialized from the on disk
  * SnapshotInfoTable from the OM RocksDB.
  */
-public class SnapshotChainManager {
+public final class SnapshotChainManager {
+  private static SnapshotChainManager instance = null;
   private static final Logger LOG =
       LoggerFactory.getLogger(SnapshotChainManager.class);
 
-  private final Map<UUID, SnapshotChainInfo> globalSnapshotChain;
+  private final Map<UUID, SnapshotChainInfo> globalSnapshotChain =
+          Collections.synchronizedMap(new LinkedHashMap<>());
   private final ConcurrentMap<String, LinkedHashMap<UUID, SnapshotChainInfo>>
-      snapshotChainByPath;
-  private final ConcurrentMap<String, UUID> latestSnapshotIdByPath;
-  private final ConcurrentMap<UUID, String> snapshotIdToTableKey;
-  private UUID latestGlobalSnapshotId;
-  private final boolean snapshotChainCorrupted;
+      snapshotChainByPath = new ConcurrentHashMap<>();
+  private final ConcurrentMap<String, UUID> latestSnapshotIdByPath = new ConcurrentHashMap<>();
+  private final ConcurrentMap<UUID, String> snapshotIdToTableKey = new ConcurrentHashMap<>();
+  private UUID latestGlobalSnapshotId = null;
+  private boolean snapshotChainCorrupted;
   private UUID oldestGlobalSnapshotId;
 
-  public SnapshotChainManager(OMMetadataManager metadataManager) {
-    globalSnapshotChain = Collections.synchronizedMap(new LinkedHashMap<>());
-    snapshotChainByPath = new ConcurrentHashMap<>();
-    latestSnapshotIdByPath = new ConcurrentHashMap<>();
-    snapshotIdToTableKey = new ConcurrentHashMap<>();
-    latestGlobalSnapshotId = null;
+  private SnapshotChainManager() { }
+
+  public static synchronized SnapshotChainManager getInstance() {
+    if (instance == null) {
+      instance = new SnapshotChainManager();
+    }
+    return instance;
+  }
+
+  public synchronized void init(OMMetadataManager metadataManager) {
     snapshotChainCorrupted = !loadFromSnapshotInfoTable(metadataManager);
   }
 
