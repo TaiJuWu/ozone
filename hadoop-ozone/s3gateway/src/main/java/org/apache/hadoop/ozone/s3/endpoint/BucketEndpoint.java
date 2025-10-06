@@ -125,7 +125,7 @@ public class BucketEndpoint extends EndpointBase {
     private final String startAfter;
     private final String marker;
 
-    public ListObjectsParams(String delimiter, String encodingType, int maxKeys,
+    ListObjectsParams(String delimiter, String encodingType, int maxKeys,
                              String prefix, String continueToken, String startAfter,
                              String marker) {
       this.delimiter = delimiter;
@@ -137,35 +137,55 @@ public class BucketEndpoint extends EndpointBase {
       this.marker = marker;
     }
 
-    // Getters
-    public String getDelimiter() { return delimiter; }
-    public String getEncodingType() { return encodingType; }
-    public int getMaxKeys() { return maxKeys; }
-    public String getPrefix() { return prefix; }
-    public String getContinueToken() { return continueToken; }
-    public String getStartAfter() { return startAfter; }
-    public String getMarker() { return marker; }
+    public String getDelimiter() {
+      return delimiter;
+    }
 
-    // 處理 marker 和 startAfter 的相容性邏輯
+    public String getEncodingType() {
+      return encodingType;
+    }
+
+    public int getMaxKeys() {
+      return maxKeys;
+    }
+
+    public String getPrefix() {
+      return prefix;
+    }
+
+    public String getContinueToken() {
+      return continueToken;
+    }
+
+    public String getStartAfter() {
+      return startAfter;
+    }
+
+    public String getMarker() {
+      return marker;
+    }
+
     public String getEffectiveStartKey() throws OS3Exception {
-      // ListObjectsV2 優先使用 continuation-token
       if (continueToken != null) {
         ContinueToken decodedToken = ContinueToken.decodeFromString(continueToken);
         return decodedToken.getLastKey();
       }
-      // 其次是 start-after
+
       if (startAfter != null) {
         return startAfter;
       }
-      // 最後是為了相容 V1 的 marker
+
       return marker;
     }
   }
 
   /**
-   * 主入口方法，現在作為一個分派器 (Dispatcher)。
-   * 它的職責是解析參數並將請求轉發給對應的處理函式。
+   * Rest endpoint to list objects in a specific bucket.
+   * <p>
+   * See: https://docs.aws.amazon.com/AmazonS3/latest/API/v2-RESTBucketGET.html
+   * for more details.
    */
+  @SuppressWarnings({"parameternumber", "methodlength"})
   public Response get(
       @PathParam("bucket") String bucketName,
       @QueryParam("delimiter") String delimiter,
@@ -198,9 +218,6 @@ public class BucketEndpoint extends EndpointBase {
     return handleListObjects(bucketName, params);
   }
 
-  /**
-   * 處理獲取 ACL 的請求。
-   */
   private Response handleGetAcl(String bucketName) throws OS3Exception, IOException {
     long startNanos = Time.monotonicNowNanos();
     S3GAction s3GAction = S3GAction.GET_ACL;
@@ -217,9 +234,6 @@ public class BucketEndpoint extends EndpointBase {
     }
   }
 
-  /**
-   * 處理列出 Multipart Uploads 的請求。
-   */
   private Response handleListMultipartUploads(String bucketName, String prefix,
                                               String keyMarker, String uploadIdMarker, int maxUploads)
       throws OS3Exception, IOException {
@@ -229,9 +243,6 @@ public class BucketEndpoint extends EndpointBase {
     return listMultipartUploads(bucketName, prefix, keyMarker, uploadIdMarker, maxUploads);
   }
 
-  /**
-   * 核心的 List Objects V2 邏輯處理。
-   */
   private Response handleListObjects(String bucketName, ListObjectsParams params)
       throws OS3Exception, IOException {
     long startNanos = Time.monotonicNowNanos();
@@ -282,9 +293,6 @@ public class BucketEndpoint extends EndpointBase {
     }
   }
 
-  /**
-   * 遍歷 OzoneKey 迭代器並建構 ListObjectResponse。
-   */
   private ListObjectResponse buildListObjectResponse(
       Iterator<? extends OzoneKey> keyIterator, String bucketName,
       ListObjectsParams params, OzoneBucket bucket) throws UnsupportedEncodingException, OS3Exception {
@@ -316,9 +324,6 @@ public class BucketEndpoint extends EndpointBase {
     return response;
   }
 
-  /**
-   * 處理單一 OzoneKey，決定是將其加入 Contents、CommonPrefixes 還是忽略。
-   */
   private void processKey(OzoneKey key, ListObjectResponse response,
                           ListingState state, String prefix, String delimiter, String encodingType, OzoneBucket bucket)
       throws UnsupportedEncodingException {
@@ -358,10 +363,6 @@ public class BucketEndpoint extends EndpointBase {
     state.setLastKey(key.getName());
   }
 
-
-  /**
-   * 輔助類別，用於封裝迴圈中的可變狀態。
-   */
   private static class ListingState {
     private final int maxKeys;
     private final String startAfter;
@@ -375,25 +376,49 @@ public class BucketEndpoint extends EndpointBase {
       this.startAfter = startAfter;
     }
 
-    void incrementCount() { this.count++; }
-    boolean isFull() { return count >= maxKeys; }
-    void processedFirstKey() { this.isFirstKey = false; }
+    void incrementCount() {
+      this.count++;
+    }
+
+    boolean isFull() {
+      return count >= maxKeys;
+    }
+
+    void processedFirstKey() {
+      this.isFirstKey = false;
+    }
 
     // Getters and Setters
-    int getCount() { return count; }
-    String getPrevDir() { return prevDir; }
-    void setPrevDir(String prevDir) { this.prevDir = prevDir; }
-    String getLastKey() { return lastKey; }
-    void setLastKey(String lastKey) { this.lastKey = lastKey; }
-    String getStartAfter() { return startAfter; }
-    boolean isFirstKey() { return isFirstKey; }
+    int getCount() {
+      return count;
+    }
+
+    String getPrevDir() {
+      return prevDir;
+    }
+
+    void setPrevDir(String prevDir) {
+      this.prevDir = prevDir;
+    }
+
+    String getLastKey() {
+      return lastKey;
+    }
+
+    void setLastKey(String lastKey) {
+      this.lastKey = lastKey;
+    }
+
+    String getStartAfter() {
+      return startAfter;
+    }
+
+    boolean isFirstKey() {
+      return isFirstKey;
+    }
   }
 
-  /**
-   * 建立一個預設值的 ListObjectResponse。
-   */
-  private ListObjectResponse createEmptyListResponse(String bucketName, ListObjectsParams params)
-      throws UnsupportedEncodingException {
+  private ListObjectResponse createEmptyListResponse(String bucketName, ListObjectsParams params) {
     ListObjectResponse response = new ListObjectResponse();
     response.setName(bucketName);
     response.setMaxKeys(params.getMaxKeys());
@@ -410,9 +435,6 @@ public class BucketEndpoint extends EndpointBase {
     return response;
   }
 
-  /**
-   * 驗證請求參數。
-   */
   private void validateListObjectsParams(ListObjectsParams params) throws OS3Exception {
     validateMaxKeys(params.getMaxKeys());
     if (params.getEncodingType() != null && !params.getEncodingType().equals(ENCODING_TYPE)) {
