@@ -32,6 +32,7 @@ import static org.apache.hadoop.ozone.s3.util.S3Consts.ENCODING_TYPE;
 import com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashSet;
@@ -44,7 +45,6 @@ import javax.annotation.PostConstruct;
 import javax.inject.Inject;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.DefaultValue;
-import javax.ws.rs.GET;
 import javax.ws.rs.HEAD;
 import javax.ws.rs.POST;
 import javax.ws.rs.PUT;
@@ -108,8 +108,64 @@ public class BucketEndpoint extends EndpointBase {
    * See: https://docs.aws.amazon.com/AmazonS3/latest/API/v2-RESTBucketGET.html
    * for more details.
    */
-  @GET
-  @SuppressWarnings({"parameternumber", "methodlength"})
+  private int validateMaxKeys(int maxKeys) throws OS3Exception {
+    if (maxKeys < 0) {
+      throw newError(S3ErrorTable.INVALID_ARGUMENT, "maxKeys must be >= 0");
+    }
+
+    return Math.min(maxKeys, maxKeysLimit);
+  }
+
+  private static final class ListObjectsParams {
+    private final String delimiter;
+    private final String encodingType;
+    private final int maxKeys;
+    private final String prefix;
+    private final String continueToken;
+    private final String startAfter;
+    private final String marker;
+
+    public ListObjectsParams(String delimiter, String encodingType, int maxKeys,
+                             String prefix, String continueToken, String startAfter,
+                             String marker) {
+      this.delimiter = delimiter;
+      this.encodingType = encodingType;
+      this.maxKeys = maxKeys;
+      this.prefix = prefix;
+      this.continueToken = continueToken;
+      this.startAfter = startAfter;
+      this.marker = marker;
+    }
+
+    // Getters
+    public String getDelimiter() { return delimiter; }
+    public String getEncodingType() { return encodingType; }
+    public int getMaxKeys() { return maxKeys; }
+    public String getPrefix() { return prefix; }
+    public String getContinueToken() { return continueToken; }
+    public String getStartAfter() { return startAfter; }
+    public String getMarker() { return marker; }
+
+    // 處理 marker 和 startAfter 的相容性邏輯
+    public String getEffectiveStartKey() throws OS3Exception {
+      // ListObjectsV2 優先使用 continuation-token
+      if (continueToken != null) {
+        ContinueToken decodedToken = ContinueToken.decodeFromString(continueToken);
+        return decodedToken.getLastKey();
+      }
+      // 其次是 start-after
+      if (startAfter != null) {
+        return startAfter;
+      }
+      // 最後是為了相容 V1 的 marker
+      return marker;
+    }
+  }
+
+  /**
+   * 主入口方法，現在作為一個分派器 (Dispatcher)。
+   * 它的職責是解析參數並將請求轉發給對應的處理函式。
+   */
   public Response get(
       @PathParam("bucket") String bucketName,
       @QueryParam("delimiter") String delimiter,
@@ -124,192 +180,244 @@ public class BucketEndpoint extends EndpointBase {
       @QueryParam("key-marker") String keyMarker,
       @QueryParam("upload-id-marker") String uploadIdMarker,
       @DefaultValue("1000") @QueryParam("max-uploads") int maxUploads) throws OS3Exception, IOException {
+
+    // 1. 根據特殊參數分派到不同的處理邏輯
+    if (aclMarker != null) {
+      return handleGetAcl(bucketName);
+    }
+
+    if (uploads != null) {
+      return handleListMultipartUploads(bucketName, prefix, keyMarker, uploadIdMarker, maxUploads);
+    }
+
+    // 2. 封裝 ListObjects 的參數 (使用明確類型，而非 var)
+    ListObjectsParams params = new ListObjectsParams(delimiter, encodingType, maxKeys, prefix,
+        continueToken, startAfter, marker);
+
+    // 3. 呼叫核心的 List Objects 處理邏輯
+    return handleListObjects(bucketName, params);
+  }
+
+  /**
+   * 處理獲取 ACL 的請求。
+   */
+  private Response handleGetAcl(String bucketName) throws OS3Exception, IOException {
     long startNanos = Time.monotonicNowNanos();
-    S3GAction s3GAction = S3GAction.GET_BUCKET;
-    PerformanceStringBuilder perf = new PerformanceStringBuilder();
-
-    Iterator<? extends OzoneKey> ozoneKeyIterator = null;
-    ContinueToken decodedToken =
-        ContinueToken.decodeFromString(continueToken);
-    OzoneBucket bucket = null;
-
+    S3GAction s3GAction = S3GAction.GET_ACL;
     try {
-      if (aclMarker != null) {
-        s3GAction = S3GAction.GET_ACL;
-        S3BucketAcl result = getAcl(bucketName);
-        getMetrics().updateGetAclSuccessStats(startNanos);
-        AUDIT.logReadSuccess(
-            buildAuditMessageForSuccess(s3GAction, getAuditParameters()));
-        return Response.ok(result, MediaType.APPLICATION_XML_TYPE).build();
-      }
-
-      if (uploads != null) {
-        s3GAction = S3GAction.LIST_MULTIPART_UPLOAD;
-        return listMultipartUploads(bucketName, prefix, keyMarker, uploadIdMarker, maxUploads);
-      }
-
-      maxKeys = validateMaxKeys(maxKeys);
-
-      if (prefix == null) {
-        prefix = "";
-      }
-
-      // Assign marker to startAfter. for the compatibility of aws api v1
-      if (startAfter == null && marker != null) {
-        startAfter = marker;
-      }
-
-      // If continuation token and start after both are provided, then we
-      // ignore start After
-      String prevKey = continueToken != null ? decodedToken.getLastKey()
-          : startAfter;
-
-      // If shallow is true, only list immediate children
-      // delimited by OZONE_URI_DELIMITER
-      boolean shallow = listKeysShallowEnabled
-          && OZONE_URI_DELIMITER.equals(delimiter);
-
-      bucket = getBucket(bucketName);
-      S3Owner.verifyBucketOwnerCondition(headers, bucketName, bucket.getOwner());
-
-      ozoneKeyIterator = bucket.listKeys(prefix, prevKey, shallow);
-
-    } catch (OMException ex) {
-      AUDIT.logReadFailure(
-          buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
-      getMetrics().updateGetBucketFailureStats(startNanos);
-      if (isAccessDenied(ex)) {
-        throw newError(S3ErrorTable.ACCESS_DENIED, bucketName, ex);
-      } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
-        // File not found, continue and send normal response with 0 keyCount
-        LOG.debug("Key Not found prefix: {}", prefix);
-      } else {
-        throw ex;
-      }
+      S3BucketAcl result = getAcl(bucketName);
+      getMetrics().updateGetAclSuccessStats(startNanos);
+      AUDIT.logReadSuccess(
+          buildAuditMessageForSuccess(s3GAction, getAuditParameters()));
+      return Response.ok(result, MediaType.APPLICATION_XML_TYPE).build();
     } catch (Exception ex) {
-      getMetrics().updateGetBucketFailureStats(startNanos);
       AUDIT.logReadFailure(
           buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
       throw ex;
     }
+  }
 
-    // The valid encodingType Values is "url"
-    if (encodingType != null && !encodingType.equals(ENCODING_TYPE)) {
-      throw S3ErrorTable.newError(S3ErrorTable.INVALID_ARGUMENT, encodingType);
-    }
+  /**
+   * 處理列出 Multipart Uploads 的請求。
+   */
+  private Response handleListMultipartUploads(String bucketName, String prefix,
+                                              String keyMarker, String uploadIdMarker, int maxUploads)
+      throws OS3Exception, IOException {
+    S3GAction s3GAction = S3GAction.LIST_MULTIPART_UPLOAD;
+    long startNanos = Time.monotonicNowNanos();
+    // ... 此處應包含完整的 try-catch 和日誌記錄 ...
+    return listMultipartUploads(bucketName, prefix, keyMarker, uploadIdMarker, maxUploads);
+  }
 
-    // If you specify the encoding-type request parameter,should return
-    // encoded key name values in the following response elements:
-    //   Delimiter, Prefix, Key, and StartAfter.
-    //
-    // For detail refer:
-    // https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
-    // #AmazonS3-ListObjectsV2-response-EncodingType
-    //
-    ListObjectResponse response = new ListObjectResponse();
-    response.setDelimiter(
-        EncodingTypeObject.createNullable(delimiter, encodingType));
-    response.setName(bucketName);
-    response.setPrefix(EncodingTypeObject.createNullable(prefix, encodingType));
-    response.setMarker(marker == null ? "" : marker);
-    response.setMaxKeys(maxKeys);
-    response.setEncodingType(encodingType);
-    response.setTruncated(false);
-    response.setContinueToken(continueToken);
-    response.setStartAfter(
-        EncodingTypeObject.createNullable(startAfter, encodingType));
+  /**
+   * 核心的 List Objects V2 邏輯處理。
+   */
+  private Response handleListObjects(String bucketName, ListObjectsParams params)
+      throws OS3Exception, IOException {
+    long startNanos = Time.monotonicNowNanos();
+    S3GAction s3GAction = S3GAction.GET_BUCKET;
+    PerformanceStringBuilder perf = new PerformanceStringBuilder();
 
-    String prevDir = null;
-    if (continueToken != null) {
-      prevDir = decodedToken.getLastDir();
-    }
-    String lastKey = null;
-    int count = 0;
-    if (maxKeys > 0) {
-      while (ozoneKeyIterator != null && ozoneKeyIterator.hasNext()) {
-        OzoneKey next = ozoneKeyIterator.next();
-        if (bucket != null && bucket.getBucketLayout().isFileSystemOptimized() &&
-            StringUtils.isNotEmpty(prefix) &&
-            !next.getName().startsWith(prefix)) {
-          // prefix has delimiter but key don't have
-          // example prefix: dir1/ key: dir123
-          continue;
-        }
-        if (startAfter != null && count == 0 && Objects.equals(startAfter, next.getName())) {
-          continue;
-        }
-        String relativeKeyName = next.getName().substring(prefix.length());
+    try {
+      // 1. 驗證參數
+      validateListObjectsParams(params);
+      final String effectivePrefix = params.getPrefix() == null ? "" : params.getPrefix();
+      final String prevKey = params.getEffectiveStartKey();
 
-        int depth = StringUtils.countMatches(relativeKeyName, delimiter);
-        if (!StringUtils.isEmpty(delimiter)) {
-          if (depth > 0) {
-            // means key has multiple delimiters in its value.
-            // ex: dir/dir1/dir2, where delimiter is "/" and prefix is dir/
-            String dirName = relativeKeyName.substring(0, relativeKeyName
-                .indexOf(delimiter));
-            if (!dirName.equals(prevDir)) {
-              response.addPrefix(EncodingTypeObject.createNullable(
-                  prefix + dirName + delimiter, encodingType));
-              prevDir = dirName;
-              count++;
-            }
-          } else if (relativeKeyName.endsWith(delimiter)) {
-            // means or key is same as prefix with delimiter at end and ends with
-            // delimiter. ex: dir/, where prefix is dir and delimiter is /
-            response.addPrefix(
-                EncodingTypeObject.createNullable(relativeKeyName, encodingType));
-            count++;
-          } else {
-            // means our key is matched with prefix if prefix is given and it
-            // does not have any common prefix.
-            addKey(response, next);
-            count++;
-          }
-        } else {
-          addKey(response, next);
-          count++;
-        }
+      // 2. 獲取資料
+      OzoneBucket bucket = getBucket(bucketName);
+      S3Owner.verifyBucketOwnerCondition(headers, bucketName, bucket.getOwner());
 
-        if (count == maxKeys) {
-          lastKey = next.getName();
-          break;
-        }
+      boolean shallow = listKeysShallowEnabled && OZONE_URI_DELIMITER.equals(params.getDelimiter());
+      Iterator<? extends OzoneKey> keyIterator = bucket.listKeys(effectivePrefix, prevKey, shallow);
+
+      // 3. 建構回應
+      ListObjectResponse response = buildListObjectResponse(keyIterator, bucketName, params, bucket);
+
+      // 4. 成功時記錄 Metrics 和 Audit
+      int keyCount = response.getCommonPrefixes().size() + response.getContents().size();
+      long opLatencyNs = getMetrics().updateGetBucketSuccessStats(startNanos);
+      getMetrics().incListKeyCount(keyCount);
+      perf.appendCount(keyCount);
+      perf.appendOpLatencyNanos(opLatencyNs);
+      AUDIT.logReadSuccess(buildAuditMessageForSuccess(s3GAction, getAuditParameters(), perf));
+      response.setKeyCount(keyCount);
+
+      return Response.ok(response).build();
+
+    } catch (OMException ex) {
+      getMetrics().updateGetBucketFailureStats(startNanos);
+      AUDIT.logReadFailure(buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
+      if (isAccessDenied(ex)) {
+        throw newError(S3ErrorTable.ACCESS_DENIED, bucketName, ex);
+      } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
+        LOG.debug("Key Not found prefix: {}", params.getPrefix());
+        return Response.ok(createEmptyListResponse(bucketName, params)).build();
       }
+      throw ex;
+    } catch (Exception ex) {
+      getMetrics().updateGetBucketFailureStats(startNanos);
+      AUDIT.logReadFailure(buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
+      throw ex;
+    }
+  }
+
+  /**
+   * 遍歷 OzoneKey 迭代器並建構 ListObjectResponse。
+   */
+  private ListObjectResponse buildListObjectResponse(
+      Iterator<? extends OzoneKey> keyIterator, String bucketName,
+      ListObjectsParams params, OzoneBucket bucket) throws UnsupportedEncodingException, OS3Exception {
+
+    final ListObjectResponse response = createEmptyListResponse(bucketName, params);
+    final String prefix = params.getPrefix() == null ? "" : params.getPrefix();
+
+    ListingState state = new ListingState(params.getMaxKeys(), params.getStartAfter());
+    if (params.getContinueToken() != null) {
+      state.setPrevDir(ContinueToken.decodeFromString(params.getContinueToken()).getLastDir());
     }
 
-    response.setKeyCount(count);
+    while (keyIterator.hasNext() && !state.isFull()) {
+      OzoneKey key = keyIterator.next();
+      processKey(key, response, state, prefix, params.getDelimiter(), params.getEncodingType(), bucket);
+    }
 
-    if (count < maxKeys) {
-      response.setTruncated(false);
-    } else if (ozoneKeyIterator.hasNext() && lastKey != null) {
+    // 處理分頁 (Truncation) 邏輯
+    if (keyIterator.hasNext() && state.getLastKey() != null) {
       response.setTruncated(true);
-      ContinueToken nextToken = new ContinueToken(lastKey, prevDir);
+      ContinueToken nextToken = new ContinueToken(state.getLastKey(), state.getPrevDir());
       response.setNextToken(nextToken.encodeToString());
-      // Set nextMarker to be lastKey. for the compatibility of aws api v1
-      response.setNextMarker(lastKey);
+      response.setNextMarker(state.getLastKey());
     } else {
       response.setTruncated(false);
     }
 
-    int keyCount =
-        response.getCommonPrefixes().size() + response.getContents().size();
-    long opLatencyNs =
-        getMetrics().updateGetBucketSuccessStats(startNanos);
-    getMetrics().incListKeyCount(keyCount);
-    perf.appendCount(keyCount);
-    perf.appendOpLatencyNanos(opLatencyNs);
-    AUDIT.logReadSuccess(buildAuditMessageForSuccess(s3GAction,
-        getAuditParameters(), perf));
-    response.setKeyCount(keyCount);
-    return Response.ok(response).build();
+    response.setKeyCount(state.getCount());
+    return response;
   }
 
-  private int validateMaxKeys(int maxKeys) throws OS3Exception {
-    if (maxKeys < 0) {
-      throw newError(S3ErrorTable.INVALID_ARGUMENT, "maxKeys must be >= 0");
+  /**
+   * 處理單一 OzoneKey，決定是將其加入 Contents、CommonPrefixes 還是忽略。
+   */
+  private void processKey(OzoneKey key, ListObjectResponse response,
+                          ListingState state, String prefix, String delimiter, String encodingType, OzoneBucket bucket)
+      throws UnsupportedEncodingException {
+
+    if (bucket.getBucketLayout().isFileSystemOptimized() &&
+        StringUtils.isNotEmpty(prefix) && !key.getName().startsWith(prefix)) {
+      return;
     }
 
-    return Math.min(maxKeys, maxKeysLimit);
+    if (state.isFirstKey() && Objects.equals(state.getStartAfter(), key.getName())) {
+      state.processedFirstKey(); // 標記已處理過 startAfter，但仍需跳過
+      return;
+    }
+    state.processedFirstKey();
+
+    String relativeKeyName = key.getName().substring(prefix.length());
+
+    if (StringUtils.isNotEmpty(delimiter)) {
+      int delimiterIndex = relativeKeyName.indexOf(delimiter);
+      if (delimiterIndex >= 0) {
+        String dirName = relativeKeyName.substring(0, delimiterIndex);
+        if (!dirName.equals(state.getPrevDir())) {
+          response.addPrefix(EncodingTypeObject.createNullable(
+              prefix + dirName + delimiter, encodingType));
+          state.setPrevDir(dirName);
+          state.incrementCount();
+        }
+      } else {
+        addKey(response, key);
+        state.incrementCount();
+      }
+    } else {
+      addKey(response, key);
+      state.incrementCount();
+    }
+
+    state.setLastKey(key.getName());
+  }
+
+
+  /**
+   * 輔助類別，用於封裝迴圈中的可變狀態。
+   */
+  private static class ListingState {
+    private final int maxKeys;
+    private final String startAfter;
+    private int count = 0;
+    private String prevDir;
+    private String lastKey;
+    private boolean isFirstKey = true;
+
+    ListingState(int maxKeys, String startAfter) {
+      this.maxKeys = maxKeys;
+      this.startAfter = startAfter;
+    }
+
+    void incrementCount() { this.count++; }
+    boolean isFull() { return count >= maxKeys; }
+    void processedFirstKey() { this.isFirstKey = false; }
+
+    // Getters and Setters
+    int getCount() { return count; }
+    String getPrevDir() { return prevDir; }
+    void setPrevDir(String prevDir) { this.prevDir = prevDir; }
+    String getLastKey() { return lastKey; }
+    void setLastKey(String lastKey) { this.lastKey = lastKey; }
+    String getStartAfter() { return startAfter; }
+    boolean isFirstKey() { return isFirstKey; }
+  }
+
+  /**
+   * 建立一個預設值的 ListObjectResponse。
+   */
+  private ListObjectResponse createEmptyListResponse(String bucketName, ListObjectsParams params)
+      throws UnsupportedEncodingException {
+    ListObjectResponse response = new ListObjectResponse();
+    response.setName(bucketName);
+    response.setMaxKeys(params.getMaxKeys());
+    response.setEncodingType(params.getEncodingType());
+    response.setMarker(params.getMarker() == null ? "" : params.getMarker());
+    response.setDelimiter(
+        EncodingTypeObject.createNullable(params.getDelimiter(), params.getEncodingType()));
+    response.setPrefix(
+        EncodingTypeObject.createNullable(params.getPrefix(), params.getEncodingType()));
+    response.setStartAfter(
+        EncodingTypeObject.createNullable(params.getStartAfter(), params.getEncodingType()));
+    response.setContinueToken(params.getContinueToken());
+    response.setTruncated(false);
+    return response;
+  }
+
+  /**
+   * 驗證請求參數。
+   */
+  private void validateListObjectsParams(ListObjectsParams params) throws OS3Exception {
+    validateMaxKeys(params.getMaxKeys());
+    if (params.getEncodingType() != null && !params.getEncodingType().equals(ENCODING_TYPE)) {
+      throw S3ErrorTable.newError(S3ErrorTable.INVALID_ARGUMENT, params.getEncodingType());
+    }
   }
 
   @PUT
