@@ -144,7 +144,7 @@ public class BucketEndpoint extends EndpointBase {
     }
 
     OperationContext op = new OperationContext(S3GAction.GET_BUCKET, bucketName, startNanos, prefix);
-    ListObjectsParams params = new ListObjectsParams(delimiter, encodingType, maxKeys, prefix,
+    ListObjectsParams params = new ListObjectsParams(delimiter, encodingType, validateMaxKeys(maxKeys), prefix,
         continueToken, startAfter, marker);
     Response resp = handleException(() -> handleListObjects(op, params), op);
     if (resp != null) {
@@ -173,16 +173,18 @@ public class BucketEndpoint extends EndpointBase {
       throws OS3Exception, IOException {
     PerformanceStringBuilder perf = new PerformanceStringBuilder();
 
-    validateListObjectsParams(params);
-    final String effectivePrefix = params.getPrefix() == null ? "" : params.getPrefix();
-    final String prevKey = params.getEffectiveStartKey();
-
     OzoneBucket bucket = getBucket(op.bucketName);
     S3Owner.verifyBucketOwnerCondition(headers, op.bucketName, bucket.getOwner());
 
+    validateListObjectsParams(params);
+    final String effectivePrefix = params.getPrefix();
+    final String prevKey = params.getPrevKey();
+
+
     // If shallow is true, only list immediate children
     // delimited by OZONE_URI_DELIMITER
-    boolean shallow = listKeysShallowEnabled && OZONE_URI_DELIMITER.equals(params.getDelimiter());
+    boolean shallow = listKeysShallowEnabled
+        && OZONE_URI_DELIMITER.equals(params.getDelimiter());
     Iterator<? extends OzoneKey> keyIterator = bucket.listKeys(effectivePrefix, prevKey, shallow);
 
     ListObjectResponse response = buildListObjectResponse(keyIterator, op.bucketName, params, bucket);
@@ -203,7 +205,7 @@ public class BucketEndpoint extends EndpointBase {
       ListObjectsParams params, OzoneBucket bucket) throws OS3Exception {
 
     final ListObjectResponse response = createEmptyListResponse(bucketName, params);
-    final String prefix = params.getPrefix() == null ? "" : params.getPrefix();
+    final String prefix = params.getPrefix();
 
     ListingState state = new ListingState(params.getMaxKeys(), params.getStartAfter());
     if (params.getContinueToken() != null) {
@@ -211,14 +213,17 @@ public class BucketEndpoint extends EndpointBase {
     }
 
     while (keyIterator.hasNext() && !state.isFull()) {
-      OzoneKey key = keyIterator.next();
-      processKey(key, response, state, prefix, params.getDelimiter(), params.getEncodingType(), bucket);
+      OzoneKey next = keyIterator.next();
+      processKey(next, response, state, prefix, params.getDelimiter(), params.getEncodingType(), bucket);
     }
 
-    if (keyIterator.hasNext() && state.getLastKey() != null) {
+    if (state.count < state.maxKeys) {
+      response.setTruncated(false);
+    } else if (keyIterator.hasNext() && state.getLastKey() != null) {
       response.setTruncated(true);
       ContinueToken nextToken = new ContinueToken(state.getLastKey(), state.getPrevDir());
       response.setNextToken(nextToken.encodeToString());
+      // Set nextMarker to be lastKey. for the compatibility of aws api v1
       response.setNextMarker(state.getLastKey());
     } else {
       response.setTruncated(false);
@@ -253,26 +258,30 @@ public class BucketEndpoint extends EndpointBase {
     return null;
   }
 
-  private void processKey(OzoneKey key, ListObjectResponse response,
+  private void processKey(OzoneKey next, ListObjectResponse response,
                           ListingState state, String prefix, String delimiter,
                           String encodingType, OzoneBucket bucket) {
 
     if (bucket.getBucketLayout().isFileSystemOptimized() &&
-        StringUtils.isNotEmpty(prefix) && !key.getName().startsWith(prefix)) {
+        StringUtils.isNotEmpty(prefix) && !next.getName().startsWith(prefix)) {
+      // prefix has delimiter but key don't have
+      // example prefix: dir1/ key: dir123
       return;
     }
 
-    if (state.isFirstKey() && Objects.equals(state.getStartAfter(), key.getName())) {
-      state.processedFirstKey(); // 標記已處理過 startAfter，但仍需跳過
+    if (state.isFirstKey() && Objects.equals(state.getStartAfter(), next.getName())) {
+      state.processedFirstKey();
       return;
     }
-    state.processedFirstKey();
 
-    String relativeKeyName = key.getName().substring(prefix.length());
+    String relativeKeyName = next.getName().substring(prefix.length());
+    int depth = StringUtils.countMatches(relativeKeyName, delimiter);
 
     if (StringUtils.isNotEmpty(delimiter)) {
       int delimiterIndex = relativeKeyName.indexOf(delimiter);
-      if (delimiterIndex >= 0) {
+      if (depth > 0) {
+        // means key has multiple delimiters in its value.
+        // ex: dir/dir1/dir2, where delimiter is "/" and prefix is dir/
         String dirName = relativeKeyName.substring(0, delimiterIndex);
         if (!dirName.equals(state.getPrevDir())) {
           response.addPrefix(EncodingTypeObject.createNullable(
@@ -280,16 +289,49 @@ public class BucketEndpoint extends EndpointBase {
           state.setPrevDir(dirName);
           state.incrementCount();
         }
+      } else if (relativeKeyName.endsWith(delimiter)) {
+        // means or key is same as prefix with delimiter at end and ends with
+        // delimiter. ex: dir/, where prefix is dir and delimiter is /
+        response.addPrefix(
+            EncodingTypeObject.createNullable(relativeKeyName, encodingType));
+        state.incrementCount();
       } else {
-        addKey(response, key);
+        // means our key is matched with prefix if prefix is given and it
+        // does not have any common prefix.
+        addKey(response, next);
         state.incrementCount();
       }
     } else {
-      addKey(response, key);
+      addKey(response, next);
       state.incrementCount();
     }
 
-    state.setLastKey(key.getName());
+    state.setLastKey(next.getName());
+  }
+
+  private ListObjectResponse createEmptyListResponse(String bucketName, ListObjectsParams params) {
+    // If you specify the encoding-type request parameter,should return
+    // encoded key name values in the following response elements:
+    //   Delimiter, Prefix, Key, and StartAfter.
+    //
+    // For detail refer:
+    // https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+    // #AmazonS3-ListObjectsV2-response-EncodingType
+    //
+    ListObjectResponse response = new ListObjectResponse();
+    response.setDelimiter(
+        EncodingTypeObject.createNullable(params.getDelimiter(), params.getEncodingType()));
+    response.setName(bucketName);
+    response.setPrefix(EncodingTypeObject.createNullable(params.getPrefix(), params.getEncodingType()));
+    response.setMarker(params.getMarker() == null ? "" : params.getMarker());
+    response.setMaxKeys(params.getMaxKeys());
+    response.setEncodingType(params.getEncodingType());
+    response.setTruncated(false);
+    response.setContinueToken(params.getContinueToken());
+    response.setStartAfter(
+        EncodingTypeObject.createNullable(params.getStartAfter(), params.getEncodingType()));
+    response.setContinueToken(params.getContinueToken());
+    return response;
   }
 
   private int validateMaxKeys(int maxKeys) throws OS3Exception {
@@ -300,175 +342,8 @@ public class BucketEndpoint extends EndpointBase {
     return Math.min(maxKeys, maxKeysLimit);
   }
 
-  private static final class OperationContext {
-    private final S3GAction s3GAction;
-    private final String bucketName;
-    private final long startNanos;
-    private final String prefix;
-
-    OperationContext(S3GAction s3GAction, String bucketName, long startNanos, String prefix) {
-      this.s3GAction = s3GAction;
-      this.bucketName = bucketName;
-      this.startNanos = startNanos;
-      this.prefix = prefix;
-    }
-
-    private S3GAction getS3Action() {
-      return s3GAction;
-    }
-
-    private String getBucketName() {
-      return bucketName;
-    }
-
-    private long getStartNanos() {
-      return startNanos;
-    }
-
-    private String getPrefix() {
-      return prefix;
-    }
-  }
-
-  private static final class ListObjectsParams {
-    private final String delimiter;
-    private final String encodingType;
-    private final int maxKeys;
-    private final String prefix;
-    private final String continueToken;
-    private final String startAfter;
-    private final String marker;
-
-    ListObjectsParams(String delimiter, String encodingType, int maxKeys,
-                      String prefix, String continueToken, String startAfter,
-                      String marker) {
-      this.delimiter = delimiter;
-      this.encodingType = encodingType;
-      this.maxKeys = maxKeys;
-      this.prefix = prefix;
-      this.continueToken = continueToken;
-      this.startAfter = startAfter;
-      this.marker = marker;
-    }
-
-    public String getDelimiter() {
-      return delimiter;
-    }
-
-    public String getEncodingType() {
-      return encodingType;
-    }
-
-    public int getMaxKeys() {
-      return maxKeys;
-    }
-
-    public String getPrefix() {
-      return prefix;
-    }
-
-    public String getContinueToken() {
-      return continueToken;
-    }
-
-    public String getStartAfter() {
-      return startAfter;
-    }
-
-    public String getMarker() {
-      return marker;
-    }
-
-    public String getEffectiveStartKey() throws OS3Exception {
-      // If continuation token and start after both are provided, then we
-      // ignore start After
-      if (continueToken != null) {
-        ContinueToken decodedToken = ContinueToken.decodeFromString(continueToken);
-        return decodedToken.getLastKey();
-      }
-
-      if (startAfter != null) {
-        return startAfter;
-      }
-
-      return marker;
-    }
-  }
-
-  private static class ListingState {
-    private final int maxKeys;
-    private final String startAfter;
-    private int count = 0;
-    private String prevDir;
-    private String lastKey;
-    private boolean isFirstKey = true;
-
-    ListingState(int maxKeys, String startAfter) {
-      this.maxKeys = maxKeys;
-      this.startAfter = startAfter;
-    }
-
-    void incrementCount() {
-      this.count++;
-    }
-
-    boolean isFull() {
-      return count >= maxKeys;
-    }
-
-    void processedFirstKey() {
-      this.isFirstKey = false;
-    }
-
-    // Getters and Setters
-    int getCount() {
-      return count;
-    }
-
-    String getPrevDir() {
-      return prevDir;
-    }
-
-    void setPrevDir(String prevDir) {
-      this.prevDir = prevDir;
-    }
-
-    String getLastKey() {
-      return lastKey;
-    }
-
-    void setLastKey(String lastKey) {
-      this.lastKey = lastKey;
-    }
-
-    String getStartAfter() {
-      return startAfter;
-    }
-
-    boolean isFirstKey() {
-      return isFirstKey;
-    }
-  }
-
-  private ListObjectResponse createEmptyListResponse(String bucketName, ListObjectsParams params) {
-    ListObjectResponse response = new ListObjectResponse();
-    response.setName(bucketName);
-    response.setMaxKeys(params.getMaxKeys());
-    response.setEncodingType(params.getEncodingType());
-    response.setMarker(params.getMarker() == null ? "" : params.getMarker());
-    response.setDelimiter(
-        EncodingTypeObject.createNullable(params.getDelimiter(), params.getEncodingType()));
-    response.setPrefix(
-        EncodingTypeObject.createNullable(params.getPrefix(), params.getEncodingType()));
-    response.setStartAfter(
-        EncodingTypeObject.createNullable(params.getStartAfter(), params.getEncodingType()));
-    response.setContinueToken(params.getContinueToken());
-    response.setTruncated(false);
-    return response;
-  }
-
   private void validateListObjectsParams(ListObjectsParams params) throws OS3Exception {
-    validateMaxKeys(params.getMaxKeys());
+    // The valid encodingType Values is "url"
     if (params.getEncodingType() != null && !params.getEncodingType().equals(ENCODING_TYPE)) {
       throw S3ErrorTable.newError(S3ErrorTable.INVALID_ARGUMENT, params.getEncodingType());
     }
@@ -852,6 +727,171 @@ public class BucketEndpoint extends EndpointBase {
     }
     getMetrics().updatePutAclSuccessStats(startNanos);
     return Response.status(HttpStatus.SC_OK).build();
+  }
+
+  private static final class OperationContext {
+    private final S3GAction s3GAction;
+    private final String bucketName;
+    private final long startNanos;
+    private final String prefix;
+
+    OperationContext(S3GAction s3GAction, String bucketName, long startNanos, String prefix) {
+      this.s3GAction = s3GAction;
+      this.bucketName = bucketName;
+      this.startNanos = startNanos;
+      this.prefix = prefix;
+    }
+
+    private S3GAction getS3Action() {
+      return s3GAction;
+    }
+
+    private String getBucketName() {
+      return bucketName;
+    }
+
+    private long getStartNanos() {
+      return startNanos;
+    }
+
+    private String getPrefix() {
+      if (prefix == null) {
+        return "";
+      }
+      return prefix;
+    }
+  }
+
+  private static final class ListObjectsParams {
+    private final String delimiter;
+    private final String encodingType;
+    private final int maxKeys;
+    private final String prefix;
+    private final String continueToken;
+    private final String startAfter;
+    private final String marker;
+
+    ListObjectsParams(String delimiter, String encodingType, int maxKeys,
+                      String prefix, String continueToken, String startAfter,
+                      String marker) {
+      this.delimiter = delimiter;
+      this.encodingType = encodingType;
+      this.maxKeys = maxKeys;
+      this.prefix = prefix;
+      this.continueToken = continueToken;
+      this.startAfter = startAfter;
+      this.marker = marker;
+    }
+
+    public String getDelimiter() {
+      return delimiter;
+    }
+
+    public String getEncodingType() {
+      return encodingType;
+    }
+
+    public int getMaxKeys() {
+      return maxKeys;
+    }
+
+    public String getPrefix() {
+      if (prefix == null) {
+        return "";
+      }
+      return prefix;
+    }
+
+    public String getContinueToken() {
+      return continueToken;
+    }
+
+    public String getStartAfter() {
+      // Assign marker to startAfter. for the compatibility of aws api v1
+      if (startAfter == null && marker != null) {
+        return marker;
+      }
+      return startAfter;
+    }
+
+    public String getPrevKey() throws OS3Exception {
+      ContinueToken decodedToken = ContinueToken.decodeFromString(continueToken);
+      return continueToken != null ? decodedToken.getLastKey()
+            : getEffectiveStartKey();
+    }
+
+    public String getMarker() {
+      return marker;
+    }
+
+    public String getEffectiveStartKey() throws OS3Exception {
+      // If continuation token and start after both are provided, then we
+      // ignore start After
+      if (continueToken != null) {
+        ContinueToken decodedToken = ContinueToken.decodeFromString(continueToken);
+        return decodedToken.getLastKey();
+      }
+
+      if (startAfter != null) {
+        return startAfter;
+      }
+
+      return marker;
+    }
+  }
+
+  private static class ListingState {
+    private final int maxKeys;
+    private final String startAfter;
+    private int count = 0;
+    private String prevDir;
+    private String lastKey;
+    private boolean isFirstKey = true;
+
+    ListingState(int maxKeys, String startAfter) {
+      this.maxKeys = maxKeys;
+      this.startAfter = startAfter;
+    }
+
+    void incrementCount() {
+      this.count++;
+    }
+
+    boolean isFull() {
+      return count >= maxKeys;
+    }
+
+    void processedFirstKey() {
+      this.isFirstKey = false;
+    }
+
+    int getCount() {
+      return count;
+    }
+
+    String getPrevDir() {
+      return prevDir;
+    }
+
+    void setPrevDir(String prevDir) {
+      this.prevDir = prevDir;
+    }
+
+    String getLastKey() {
+      return lastKey;
+    }
+
+    void setLastKey(String lastKey) {
+      this.lastKey = lastKey;
+    }
+
+    String getStartAfter() {
+      return startAfter;
+    }
+
+    boolean isFirstKey() {
+      return isFirstKey;
+    }
   }
 
   /**
