@@ -228,7 +228,8 @@ public class BucketEndpoint extends EndpointBase {
     return response;
   }
 
-  private Response handleException(Callable<Response> exec, OperationContext op) throws Exception {
+  private Response handleException(Callable<Response> exec, OperationContext op)
+      throws Exception {
     try {
       return exec.call();
     } catch (OMException ex) {
