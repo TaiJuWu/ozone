@@ -39,10 +39,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
-import java.util.function.Supplier;
 import javax.annotation.PostConstruct;
 import javax.inject.Inject;
 import javax.ws.rs.DELETE;
@@ -145,11 +143,10 @@ public class BucketEndpoint extends EndpointBase {
       }
     }
 
-    ListObjectsParams params = new ListObjectsParams(delimiter, encodingType, maxKeys, prefix,
-        continueToken, startAfter, marker, startNanos);
-
     OperationContext op = new OperationContext(S3GAction.GET_BUCKET, bucketName, startNanos, prefix);
-    Response resp = handleException(() -> handleListObjects(bucketName, params, op), op);
+    ListObjectsParams params = new ListObjectsParams(delimiter, encodingType, maxKeys, prefix,
+        continueToken, startAfter, marker);
+    Response resp = handleException(() -> handleListObjects(op, params), op);
     if (resp != null) {
       return resp;
     }
@@ -173,7 +170,7 @@ public class BucketEndpoint extends EndpointBase {
     return listMultipartUploads(op.bucketName, op.prefix, keyMarker, uploadIdMarker, maxUploads);
   }
 
-  private Response handleListObjects(String bucketName, ListObjectsParams params, OperationContext op)
+  private Response handleListObjects(OperationContext op, ListObjectsParams params)
       throws OS3Exception, IOException {
     PerformanceStringBuilder perf = new PerformanceStringBuilder();
 
@@ -181,13 +178,15 @@ public class BucketEndpoint extends EndpointBase {
     final String effectivePrefix = params.getPrefix() == null ? "" : params.getPrefix();
     final String prevKey = params.getEffectiveStartKey();
 
-    OzoneBucket bucket = getBucket(bucketName);
-    S3Owner.verifyBucketOwnerCondition(headers, bucketName, bucket.getOwner());
+    OzoneBucket bucket = getBucket(op.bucketName);
+    S3Owner.verifyBucketOwnerCondition(headers, op.bucketName, bucket.getOwner());
 
+    // If shallow is true, only list immediate children
+    // delimited by OZONE_URI_DELIMITER
     boolean shallow = listKeysShallowEnabled && OZONE_URI_DELIMITER.equals(params.getDelimiter());
     Iterator<? extends OzoneKey> keyIterator = bucket.listKeys(effectivePrefix, prevKey, shallow);
 
-    ListObjectResponse response = buildListObjectResponse(keyIterator, bucketName, params, bucket);
+    ListObjectResponse response = buildListObjectResponse(keyIterator, op.bucketName, params, bucket);
 
     int keyCount = response.getCommonPrefixes().size() + response.getContents().size();
     long opLatencyNs = getMetrics().updateGetBucketSuccessStats(op.startNanos);
@@ -240,7 +239,7 @@ public class BucketEndpoint extends EndpointBase {
       if (isAccessDenied(ex)) {
         throw newError(S3ErrorTable.ACCESS_DENIED, op.bucketName, ex);
       } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
-        // File not found, continue and send normal response with 0 keyCount
+        // File not found, continue and send normal response with 0 keyCount and return null
         LOG.debug("Key Not found prefix: {}", op.prefix);
       } else {
         throw ex;
@@ -326,7 +325,7 @@ public class BucketEndpoint extends EndpointBase {
 
     ListObjectsParams(String delimiter, String encodingType, int maxKeys,
                       String prefix, String continueToken, String startAfter,
-                      String marker, long startNano) {
+                      String marker) {
       this.delimiter = delimiter;
       this.encodingType = encodingType;
       this.maxKeys = maxKeys;
@@ -365,6 +364,8 @@ public class BucketEndpoint extends EndpointBase {
     }
 
     public String getEffectiveStartKey() throws OS3Exception {
+      // If continuation token and start after both are provided, then we
+      // ignore start After
       if (continueToken != null) {
         ContinueToken decodedToken = ContinueToken.decodeFromString(continueToken);
         return decodedToken.getLastKey();
