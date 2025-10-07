@@ -32,7 +32,6 @@ import static org.apache.hadoop.ozone.s3.util.S3Consts.ENCODING_TYPE;
 import com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashSet;
@@ -40,11 +39,15 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.function.Supplier;
 import javax.annotation.PostConstruct;
 import javax.inject.Inject;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.DefaultValue;
+import javax.ws.rs.GET;
 import javax.ws.rs.HEAD;
 import javax.ws.rs.POST;
 import javax.ws.rs.PUT;
@@ -108,12 +111,208 @@ public class BucketEndpoint extends EndpointBase {
    * See: https://docs.aws.amazon.com/AmazonS3/latest/API/v2-RESTBucketGET.html
    * for more details.
    */
+  @GET
+  @SuppressWarnings({"parameternumber", "methodlength"})
+  public Response get(
+      @PathParam("bucket") String bucketName,
+      @QueryParam("delimiter") String delimiter,
+      @QueryParam("encoding-type") String encodingType,
+      @QueryParam("marker") String marker,
+      @DefaultValue("1000") @QueryParam("max-keys") int maxKeys,
+      @QueryParam("prefix") String prefix,
+      @QueryParam("continuation-token") String continueToken,
+      @QueryParam("start-after") String startAfter,
+      @QueryParam("uploads") String uploads,
+      @QueryParam("acl") String aclMarker,
+      @QueryParam("key-marker") String keyMarker,
+      @QueryParam("upload-id-marker") String uploadIdMarker,
+      @DefaultValue("1000") @QueryParam("max-uploads") int maxUploads) throws Exception {
+    long startNanos = Time.monotonicNowNanos();
+
+    if (aclMarker != null) {
+      OperationContext op = new OperationContext(S3GAction.GET_ACL, bucketName, startNanos, prefix);
+      Response resp = handleException(() -> handleGetAcl(op), op);
+      if (resp != null) {
+        return resp;
+      }
+    }
+
+    if (uploads != null) {
+      OperationContext op = new OperationContext(S3GAction.LIST_MULTIPART_UPLOAD, bucketName, startNanos, prefix);
+      Response resp = handleException(() -> handleListMultipartUploads(op, keyMarker, uploadIdMarker, maxUploads), op);
+      if (resp != null) {
+        return resp;
+      }
+    }
+
+    ListObjectsParams params = new ListObjectsParams(delimiter, encodingType, maxKeys, prefix,
+        continueToken, startAfter, marker, startNanos);
+
+    OperationContext op = new OperationContext(S3GAction.GET_BUCKET, bucketName, startNanos, prefix);
+    Response resp = handleException(() -> handleListObjects(bucketName, params, op), op);
+    if (resp != null) {
+      return resp;
+    }
+
+    return Response.ok(createEmptyListResponse(bucketName, params)).build();
+  }
+
+
+  private Response handleGetAcl(OperationContext op) throws OS3Exception, IOException {
+    S3BucketAcl result = getAcl(op.bucketName);
+    getMetrics().updateGetAclSuccessStats(op.startNanos);
+    AUDIT.logReadSuccess(
+        buildAuditMessageForSuccess(op.s3GAction, getAuditParameters()));
+    return Response.ok(result, MediaType.APPLICATION_XML_TYPE).build();
+  }
+
+  private Response handleListMultipartUploads(OperationContext op,
+                                              String keyMarker, String uploadIdMarker,
+                                              int maxUploads)
+      throws OS3Exception, IOException {
+    return listMultipartUploads(op.bucketName, op.prefix, keyMarker, uploadIdMarker, maxUploads);
+  }
+
+  private Response handleListObjects(String bucketName, ListObjectsParams params, OperationContext op)
+      throws OS3Exception, IOException {
+    PerformanceStringBuilder perf = new PerformanceStringBuilder();
+
+    validateListObjectsParams(params);
+    final String effectivePrefix = params.getPrefix() == null ? "" : params.getPrefix();
+    final String prevKey = params.getEffectiveStartKey();
+
+    OzoneBucket bucket = getBucket(bucketName);
+    S3Owner.verifyBucketOwnerCondition(headers, bucketName, bucket.getOwner());
+
+    boolean shallow = listKeysShallowEnabled && OZONE_URI_DELIMITER.equals(params.getDelimiter());
+    Iterator<? extends OzoneKey> keyIterator = bucket.listKeys(effectivePrefix, prevKey, shallow);
+
+    ListObjectResponse response = buildListObjectResponse(keyIterator, bucketName, params, bucket);
+
+    int keyCount = response.getCommonPrefixes().size() + response.getContents().size();
+    long opLatencyNs = getMetrics().updateGetBucketSuccessStats(op.startNanos);
+    getMetrics().incListKeyCount(keyCount);
+    perf.appendCount(keyCount);
+    perf.appendOpLatencyNanos(opLatencyNs);
+    AUDIT.logReadSuccess(buildAuditMessageForSuccess(op.s3GAction, getAuditParameters(), perf));
+    response.setKeyCount(keyCount);
+
+    return Response.ok(response).build();
+  }
+
+  private ListObjectResponse buildListObjectResponse(
+      Iterator<? extends OzoneKey> keyIterator, String bucketName,
+      ListObjectsParams params, OzoneBucket bucket) throws OS3Exception {
+
+    final ListObjectResponse response = createEmptyListResponse(bucketName, params);
+    final String prefix = params.getPrefix() == null ? "" : params.getPrefix();
+
+    ListingState state = new ListingState(params.getMaxKeys(), params.getStartAfter());
+    if (params.getContinueToken() != null) {
+      state.setPrevDir(ContinueToken.decodeFromString(params.getContinueToken()).getLastDir());
+    }
+
+    while (keyIterator.hasNext() && !state.isFull()) {
+      OzoneKey key = keyIterator.next();
+      processKey(key, response, state, prefix, params.getDelimiter(), params.getEncodingType(), bucket);
+    }
+
+    if (keyIterator.hasNext() && state.getLastKey() != null) {
+      response.setTruncated(true);
+      ContinueToken nextToken = new ContinueToken(state.getLastKey(), state.getPrevDir());
+      response.setNextToken(nextToken.encodeToString());
+      response.setNextMarker(state.getLastKey());
+    } else {
+      response.setTruncated(false);
+    }
+
+    response.setKeyCount(state.getCount());
+    return response;
+  }
+
+  private Response handleException(Callable<Response> exec, OperationContext op) throws Exception {
+    try {
+      return exec.call();
+    } catch (OMException ex) {
+      AUDIT.logReadFailure(
+          buildAuditMessageForFailure(op.s3GAction, getAuditParameters(), ex));
+      getMetrics().updateGetBucketFailureStats(op.startNanos);
+      if (isAccessDenied(ex)) {
+        throw newError(S3ErrorTable.ACCESS_DENIED, op.bucketName, ex);
+      } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
+        // File not found, continue and send normal response with 0 keyCount
+        LOG.debug("Key Not found prefix: {}", op.prefix);
+      } else {
+        throw ex;
+      }
+    } catch (Exception ex) {
+      getMetrics().updateGetBucketFailureStats(op.startNanos);
+      AUDIT.logReadFailure(
+          buildAuditMessageForFailure(op.s3GAction, getAuditParameters(), ex));
+      throw ex;
+    }
+    return null;
+  }
+
+  private void processKey(OzoneKey key, ListObjectResponse response,
+                          ListingState state, String prefix, String delimiter,
+                          String encodingType, OzoneBucket bucket) {
+
+    if (bucket.getBucketLayout().isFileSystemOptimized() &&
+        StringUtils.isNotEmpty(prefix) && !key.getName().startsWith(prefix)) {
+      return;
+    }
+
+    if (state.isFirstKey() && Objects.equals(state.getStartAfter(), key.getName())) {
+      state.processedFirstKey(); // 標記已處理過 startAfter，但仍需跳過
+      return;
+    }
+    state.processedFirstKey();
+
+    String relativeKeyName = key.getName().substring(prefix.length());
+
+    if (StringUtils.isNotEmpty(delimiter)) {
+      int delimiterIndex = relativeKeyName.indexOf(delimiter);
+      if (delimiterIndex >= 0) {
+        String dirName = relativeKeyName.substring(0, delimiterIndex);
+        if (!dirName.equals(state.getPrevDir())) {
+          response.addPrefix(EncodingTypeObject.createNullable(
+              prefix + dirName + delimiter, encodingType));
+          state.setPrevDir(dirName);
+          state.incrementCount();
+        }
+      } else {
+        addKey(response, key);
+        state.incrementCount();
+      }
+    } else {
+      addKey(response, key);
+      state.incrementCount();
+    }
+
+    state.setLastKey(key.getName());
+  }
+
   private int validateMaxKeys(int maxKeys) throws OS3Exception {
     if (maxKeys < 0) {
       throw newError(S3ErrorTable.INVALID_ARGUMENT, "maxKeys must be >= 0");
     }
 
     return Math.min(maxKeys, maxKeysLimit);
+  }
+
+  private static final class OperationContext {
+    public final S3GAction s3GAction;
+    public final String bucketName;
+    public final long startNanos;
+    public final String prefix;
+
+    public OperationContext(S3GAction s3GAction, String bucketName, long startNanos, String prefix) {
+      this.s3GAction = s3GAction;
+      this.bucketName = bucketName;
+      this.startNanos = startNanos;
+      this.prefix = prefix;
+    }
   }
 
   private static final class ListObjectsParams {
@@ -126,8 +325,8 @@ public class BucketEndpoint extends EndpointBase {
     private final String marker;
 
     ListObjectsParams(String delimiter, String encodingType, int maxKeys,
-                             String prefix, String continueToken, String startAfter,
-                             String marker) {
+                      String prefix, String continueToken, String startAfter,
+                      String marker, long startNano) {
       this.delimiter = delimiter;
       this.encodingType = encodingType;
       this.maxKeys = maxKeys;
@@ -179,189 +378,6 @@ public class BucketEndpoint extends EndpointBase {
     }
   }
 
-  /**
-   * Rest endpoint to list objects in a specific bucket.
-   * <p>
-   * See: https://docs.aws.amazon.com/AmazonS3/latest/API/v2-RESTBucketGET.html
-   * for more details.
-   */
-  @SuppressWarnings({"parameternumber", "methodlength"})
-  public Response get(
-      @PathParam("bucket") String bucketName,
-      @QueryParam("delimiter") String delimiter,
-      @QueryParam("encoding-type") String encodingType,
-      @QueryParam("marker") String marker,
-      @DefaultValue("1000") @QueryParam("max-keys") int maxKeys,
-      @QueryParam("prefix") String prefix,
-      @QueryParam("continuation-token") String continueToken,
-      @QueryParam("start-after") String startAfter,
-      @QueryParam("uploads") String uploads,
-      @QueryParam("acl") String aclMarker,
-      @QueryParam("key-marker") String keyMarker,
-      @QueryParam("upload-id-marker") String uploadIdMarker,
-      @DefaultValue("1000") @QueryParam("max-uploads") int maxUploads) throws OS3Exception, IOException {
-
-    // 1. 根據特殊參數分派到不同的處理邏輯
-    if (aclMarker != null) {
-      return handleGetAcl(bucketName);
-    }
-
-    if (uploads != null) {
-      return handleListMultipartUploads(bucketName, prefix, keyMarker, uploadIdMarker, maxUploads);
-    }
-
-    // 2. 封裝 ListObjects 的參數 (使用明確類型，而非 var)
-    ListObjectsParams params = new ListObjectsParams(delimiter, encodingType, maxKeys, prefix,
-        continueToken, startAfter, marker);
-
-    // 3. 呼叫核心的 List Objects 處理邏輯
-    return handleListObjects(bucketName, params);
-  }
-
-  private Response handleGetAcl(String bucketName) throws OS3Exception, IOException {
-    long startNanos = Time.monotonicNowNanos();
-    S3GAction s3GAction = S3GAction.GET_ACL;
-    try {
-      S3BucketAcl result = getAcl(bucketName);
-      getMetrics().updateGetAclSuccessStats(startNanos);
-      AUDIT.logReadSuccess(
-          buildAuditMessageForSuccess(s3GAction, getAuditParameters()));
-      return Response.ok(result, MediaType.APPLICATION_XML_TYPE).build();
-    } catch (Exception ex) {
-      AUDIT.logReadFailure(
-          buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
-      throw ex;
-    }
-  }
-
-  private Response handleListMultipartUploads(String bucketName, String prefix,
-                                              String keyMarker, String uploadIdMarker, int maxUploads)
-      throws OS3Exception, IOException {
-    S3GAction s3GAction = S3GAction.LIST_MULTIPART_UPLOAD;
-    long startNanos = Time.monotonicNowNanos();
-    // ... 此處應包含完整的 try-catch 和日誌記錄 ...
-    return listMultipartUploads(bucketName, prefix, keyMarker, uploadIdMarker, maxUploads);
-  }
-
-  private Response handleListObjects(String bucketName, ListObjectsParams params)
-      throws OS3Exception, IOException {
-    long startNanos = Time.monotonicNowNanos();
-    S3GAction s3GAction = S3GAction.GET_BUCKET;
-    PerformanceStringBuilder perf = new PerformanceStringBuilder();
-
-    try {
-      // 1. 驗證參數
-      validateListObjectsParams(params);
-      final String effectivePrefix = params.getPrefix() == null ? "" : params.getPrefix();
-      final String prevKey = params.getEffectiveStartKey();
-
-      // 2. 獲取資料
-      OzoneBucket bucket = getBucket(bucketName);
-      S3Owner.verifyBucketOwnerCondition(headers, bucketName, bucket.getOwner());
-
-      boolean shallow = listKeysShallowEnabled && OZONE_URI_DELIMITER.equals(params.getDelimiter());
-      Iterator<? extends OzoneKey> keyIterator = bucket.listKeys(effectivePrefix, prevKey, shallow);
-
-      // 3. 建構回應
-      ListObjectResponse response = buildListObjectResponse(keyIterator, bucketName, params, bucket);
-
-      // 4. 成功時記錄 Metrics 和 Audit
-      int keyCount = response.getCommonPrefixes().size() + response.getContents().size();
-      long opLatencyNs = getMetrics().updateGetBucketSuccessStats(startNanos);
-      getMetrics().incListKeyCount(keyCount);
-      perf.appendCount(keyCount);
-      perf.appendOpLatencyNanos(opLatencyNs);
-      AUDIT.logReadSuccess(buildAuditMessageForSuccess(s3GAction, getAuditParameters(), perf));
-      response.setKeyCount(keyCount);
-
-      return Response.ok(response).build();
-
-    } catch (OMException ex) {
-      getMetrics().updateGetBucketFailureStats(startNanos);
-      AUDIT.logReadFailure(buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
-      if (isAccessDenied(ex)) {
-        throw newError(S3ErrorTable.ACCESS_DENIED, bucketName, ex);
-      } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
-        LOG.debug("Key Not found prefix: {}", params.getPrefix());
-        return Response.ok(createEmptyListResponse(bucketName, params)).build();
-      }
-      throw ex;
-    } catch (Exception ex) {
-      getMetrics().updateGetBucketFailureStats(startNanos);
-      AUDIT.logReadFailure(buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
-      throw ex;
-    }
-  }
-
-  private ListObjectResponse buildListObjectResponse(
-      Iterator<? extends OzoneKey> keyIterator, String bucketName,
-      ListObjectsParams params, OzoneBucket bucket) throws UnsupportedEncodingException, OS3Exception {
-
-    final ListObjectResponse response = createEmptyListResponse(bucketName, params);
-    final String prefix = params.getPrefix() == null ? "" : params.getPrefix();
-
-    ListingState state = new ListingState(params.getMaxKeys(), params.getStartAfter());
-    if (params.getContinueToken() != null) {
-      state.setPrevDir(ContinueToken.decodeFromString(params.getContinueToken()).getLastDir());
-    }
-
-    while (keyIterator.hasNext() && !state.isFull()) {
-      OzoneKey key = keyIterator.next();
-      processKey(key, response, state, prefix, params.getDelimiter(), params.getEncodingType(), bucket);
-    }
-
-    // 處理分頁 (Truncation) 邏輯
-    if (keyIterator.hasNext() && state.getLastKey() != null) {
-      response.setTruncated(true);
-      ContinueToken nextToken = new ContinueToken(state.getLastKey(), state.getPrevDir());
-      response.setNextToken(nextToken.encodeToString());
-      response.setNextMarker(state.getLastKey());
-    } else {
-      response.setTruncated(false);
-    }
-
-    response.setKeyCount(state.getCount());
-    return response;
-  }
-
-  private void processKey(OzoneKey key, ListObjectResponse response,
-                          ListingState state, String prefix, String delimiter, String encodingType, OzoneBucket bucket)
-      throws UnsupportedEncodingException {
-
-    if (bucket.getBucketLayout().isFileSystemOptimized() &&
-        StringUtils.isNotEmpty(prefix) && !key.getName().startsWith(prefix)) {
-      return;
-    }
-
-    if (state.isFirstKey() && Objects.equals(state.getStartAfter(), key.getName())) {
-      state.processedFirstKey(); // 標記已處理過 startAfter，但仍需跳過
-      return;
-    }
-    state.processedFirstKey();
-
-    String relativeKeyName = key.getName().substring(prefix.length());
-
-    if (StringUtils.isNotEmpty(delimiter)) {
-      int delimiterIndex = relativeKeyName.indexOf(delimiter);
-      if (delimiterIndex >= 0) {
-        String dirName = relativeKeyName.substring(0, delimiterIndex);
-        if (!dirName.equals(state.getPrevDir())) {
-          response.addPrefix(EncodingTypeObject.createNullable(
-              prefix + dirName + delimiter, encodingType));
-          state.setPrevDir(dirName);
-          state.incrementCount();
-        }
-      } else {
-        addKey(response, key);
-        state.incrementCount();
-      }
-    } else {
-      addKey(response, key);
-      state.incrementCount();
-    }
-
-    state.setLastKey(key.getName());
-  }
 
   private static class ListingState {
     private final int maxKeys;
