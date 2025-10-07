@@ -156,9 +156,9 @@ public class BucketEndpoint extends EndpointBase {
 
   private Response handleGetAcl(OperationContext op) throws OS3Exception, IOException {
     S3BucketAcl result = getAcl(op.bucketName);
-    getMetrics().updateGetAclSuccessStats(op.startNanos);
+    getMetrics().updateGetAclSuccessStats(op.getStartNanos());
     AUDIT.logReadSuccess(
-        buildAuditMessageForSuccess(op.s3GAction, getAuditParameters()));
+        buildAuditMessageForSuccess(op.getS3Action(), getAuditParameters()));
     return Response.ok(result, MediaType.APPLICATION_XML_TYPE).build();
   }
 
@@ -166,7 +166,7 @@ public class BucketEndpoint extends EndpointBase {
                                               String keyMarker, String uploadIdMarker,
                                               int maxUploads)
       throws OS3Exception, IOException {
-    return listMultipartUploads(op.bucketName, op.prefix, keyMarker, uploadIdMarker, maxUploads);
+    return listMultipartUploads(op.getBucketName(), op.getPrefix(), keyMarker, uploadIdMarker, maxUploads);
   }
 
   private Response handleListObjects(OperationContext op, ListObjectsParams params)
@@ -321,11 +321,11 @@ public class BucketEndpoint extends EndpointBase {
       return bucketName;
     }
 
-    private long startNanos() {
+    private long getStartNanos() {
       return startNanos;
     }
 
-    private String prefix() {
+    private String getPrefix() {
       return prefix;
     }
   }
