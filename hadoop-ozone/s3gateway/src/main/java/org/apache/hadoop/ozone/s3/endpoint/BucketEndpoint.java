@@ -154,7 +154,6 @@ public class BucketEndpoint extends EndpointBase {
     return Response.ok(createEmptyListResponse(bucketName, params)).build();
   }
 
-
   private Response handleGetAcl(OperationContext op) throws OS3Exception, IOException {
     S3BucketAcl result = getAcl(op.bucketName);
     getMetrics().updateGetAclSuccessStats(op.startNanos);
@@ -301,16 +300,32 @@ public class BucketEndpoint extends EndpointBase {
   }
 
   private static final class OperationContext {
-    public final S3GAction s3GAction;
-    public final String bucketName;
-    public final long startNanos;
-    public final String prefix;
+    private final S3GAction s3GAction;
+    private final String bucketName;
+    private final long startNanos;
+    private final String prefix;
 
-    public OperationContext(S3GAction s3GAction, String bucketName, long startNanos, String prefix) {
+    OperationContext(S3GAction s3GAction, String bucketName, long startNanos, String prefix) {
       this.s3GAction = s3GAction;
       this.bucketName = bucketName;
       this.startNanos = startNanos;
       this.prefix = prefix;
+    }
+
+    private S3GAction getS3Action() {
+      return s3GAction;
+    }
+
+    private String getBucketName() {
+      return bucketName;
+    }
+
+    private long startNanos() {
+      return startNanos;
+    }
+
+    private String prefix() {
+      return prefix;
     }
   }
 
@@ -378,7 +393,6 @@ public class BucketEndpoint extends EndpointBase {
       return marker;
     }
   }
-
 
   private static class ListingState {
     private final int maxKeys;
