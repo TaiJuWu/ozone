@@ -173,29 +173,164 @@ public class BucketEndpoint extends EndpointBase {
   private Response handleListObjects(OperationContext op, ListObjectsParams params)
       throws OS3Exception, IOException {
     PerformanceStringBuilder perf = new PerformanceStringBuilder();
+    ContinueToken decodedToken =
+        ContinueToken.decodeFromString(params.continueToken);
+    OzoneBucket bucket = null;
+    Iterator<? extends OzoneKey> ozoneKeyIterator = null;
+    try {
+      params.maxKeys = validateMaxKeys(params.getMaxKeys());
 
-    validateListObjectsParams(params);
-    final String effectivePrefix = params.getPrefix() == null ? "" : params.getPrefix();
-    final String prevKey = params.getEffectiveStartKey();
+      if (params.getPrefix() == null) {
+        params.prefix = "";
+      }
 
-    OzoneBucket bucket = getBucket(op.bucketName);
-    S3Owner.verifyBucketOwnerCondition(headers, op.bucketName, bucket.getOwner());
+      // Assign marker to startAfter. for the compatibility of aws api v1
+      if (params.startAfter == null && params.marker != null) {
+        params.startAfter = params.marker;
+      }
 
-    // If shallow is true, only list immediate children
-    // delimited by OZONE_URI_DELIMITER
-    boolean shallow = listKeysShallowEnabled && OZONE_URI_DELIMITER.equals(params.getDelimiter());
-    Iterator<? extends OzoneKey> keyIterator = bucket.listKeys(effectivePrefix, prevKey, shallow);
+      // If continuation token and start after both are provided, then we
+      // ignore start After
+      String prevKey = params.continueToken != null ? decodedToken.getLastKey()
+          : params.startAfter;
 
-    ListObjectResponse response = buildListObjectResponse(keyIterator, op.bucketName, params, bucket);
+      // If shallow is true, only list immediate children
+      // delimited by OZONE_URI_DELIMITER
+      boolean shallow = listKeysShallowEnabled
+          && OZONE_URI_DELIMITER.equals(params.delimiter);
 
-    int keyCount = response.getCommonPrefixes().size() + response.getContents().size();
-    long opLatencyNs = getMetrics().updateGetBucketSuccessStats(op.startNanos);
+      bucket = getBucket(op.bucketName);
+      S3Owner.verifyBucketOwnerCondition(headers, op.bucketName, bucket.getOwner());
+
+      ozoneKeyIterator = bucket.listKeys(params.prefix, prevKey, shallow);
+
+    } catch (OMException ex) {
+      AUDIT.logReadFailure(
+          buildAuditMessageForFailure(op.s3GAction, getAuditParameters(), ex));
+      getMetrics().updateGetBucketFailureStats(op.startNanos);
+      if (isAccessDenied(ex)) {
+        throw newError(S3ErrorTable.ACCESS_DENIED, op.bucketName, ex);
+      } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
+        // File not found, continue and send normal response with 0 keyCount
+        LOG.debug("Key Not found prefix: {}", params.prefix);
+      } else {
+        throw ex;
+      }
+    } catch (Exception ex) {
+      getMetrics().updateGetBucketFailureStats(op.startNanos);
+      AUDIT.logReadFailure(
+          buildAuditMessageForFailure(op.s3GAction, getAuditParameters(), ex));
+      throw ex;
+    }
+
+    // The valid encodingType Values is "url"
+    if (params.encodingType != null && !params.encodingType.equals(ENCODING_TYPE)) {
+      throw S3ErrorTable.newError(S3ErrorTable.INVALID_ARGUMENT, params.encodingType);
+    }
+
+    // If you specify the encoding-type request parameter,should return
+    // encoded key name values in the following response elements:
+    //   Delimiter, Prefix, Key, and StartAfter.
+    //
+    // For detail refer:
+    // https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+    // #AmazonS3-ListObjectsV2-response-EncodingType
+    //
+    ListObjectResponse response = new ListObjectResponse();
+    response.setDelimiter(
+        EncodingTypeObject.createNullable(params.delimiter, params.encodingType));
+    response.setName(op.bucketName);
+    response.setPrefix(EncodingTypeObject.createNullable(op.prefix, params.encodingType));
+    response.setMarker(params.marker == null ? "" : params.marker);
+    response.setMaxKeys(params.maxKeys);
+    response.setEncodingType(params.encodingType);
+    response.setTruncated(false);
+    response.setContinueToken(params.continueToken);
+    response.setStartAfter(
+        EncodingTypeObject.createNullable(params.startAfter, params.encodingType));
+
+    String prevDir = null;
+    if (params.continueToken != null) {
+      prevDir = decodedToken.getLastDir();
+    }
+    String lastKey = null;
+    int count = 0;
+    if (params.maxKeys > 0) {
+      while (ozoneKeyIterator != null && ozoneKeyIterator.hasNext()) {
+        OzoneKey next = ozoneKeyIterator.next();
+        if (bucket != null && bucket.getBucketLayout().isFileSystemOptimized() &&
+            StringUtils.isNotEmpty(params.prefix) &&
+            !next.getName().startsWith(params.prefix)) {
+          // prefix has delimiter but key don't have
+          // example prefix: dir1/ key: dir123
+          continue;
+        }
+        if (params.startAfter != null && count == 0 && Objects.equals(params.startAfter, next.getName())) {
+          continue;
+        }
+        String relativeKeyName = next.getName().substring(params.prefix.length());
+
+        int depth = StringUtils.countMatches(relativeKeyName, params.delimiter);
+        if (!StringUtils.isEmpty(params.delimiter)) {
+          if (depth > 0) {
+            // means key has multiple delimiters in its value.
+            // ex: dir/dir1/dir2, where delimiter is "/" and prefix is dir/
+            String dirName = relativeKeyName.substring(0, relativeKeyName
+                .indexOf(params.delimiter));
+            if (!dirName.equals(prevDir)) {
+              response.addPrefix(EncodingTypeObject.createNullable(
+                  params.prefix + dirName + params.delimiter, params.encodingType));
+              prevDir = dirName;
+              count++;
+            }
+          } else if (relativeKeyName.endsWith(params.delimiter)) {
+            // means or key is same as prefix with delimiter at end and ends with
+            // delimiter. ex: dir/, where prefix is dir and delimiter is /
+            response.addPrefix(
+                EncodingTypeObject.createNullable(relativeKeyName, params.encodingType));
+            count++;
+          } else {
+            // means our key is matched with prefix if prefix is given and it
+            // does not have any common prefix.
+            addKey(response, next);
+            count++;
+          }
+        } else {
+          addKey(response, next);
+          count++;
+        }
+
+        if (count == params.maxKeys) {
+          lastKey = next.getName();
+          break;
+        }
+      }
+    }
+
+    response.setKeyCount(count);
+
+    if (count < params.maxKeys) {
+      response.setTruncated(false);
+    } else if (ozoneKeyIterator.hasNext() && lastKey != null) {
+      response.setTruncated(true);
+      ContinueToken nextToken = new ContinueToken(lastKey, prevDir);
+      response.setNextToken(nextToken.encodeToString());
+      // Set nextMarker to be lastKey. for the compatibility of aws api v1
+      response.setNextMarker(lastKey);
+    } else {
+      response.setTruncated(false);
+    }
+
+    int keyCount =
+        response.getCommonPrefixes().size() + response.getContents().size();
+    long opLatencyNs =
+        getMetrics().updateGetBucketSuccessStats(op.startNanos);
     getMetrics().incListKeyCount(keyCount);
     perf.appendCount(keyCount);
     perf.appendOpLatencyNanos(opLatencyNs);
-    AUDIT.logReadSuccess(buildAuditMessageForSuccess(op.s3GAction, getAuditParameters(), perf));
+    AUDIT.logReadSuccess(buildAuditMessageForSuccess(op.s3GAction,
+        getAuditParameters(), perf));
     response.setKeyCount(keyCount);
-
     return Response.ok(response).build();
   }
 
@@ -315,13 +450,13 @@ public class BucketEndpoint extends EndpointBase {
   }
 
   private static final class ListObjectsParams {
-    private final String delimiter;
-    private final String encodingType;
-    private final int maxKeys;
-    private final String prefix;
-    private final String continueToken;
-    private final String startAfter;
-    private final String marker;
+    public  String delimiter;
+    public String encodingType;
+    public  int maxKeys;
+    public  String prefix;
+    public  String continueToken;
+    public  String startAfter;
+    public  String marker;
 
     ListObjectsParams(String delimiter, String encodingType, int maxKeys,
                       String prefix, String continueToken, String startAfter,
