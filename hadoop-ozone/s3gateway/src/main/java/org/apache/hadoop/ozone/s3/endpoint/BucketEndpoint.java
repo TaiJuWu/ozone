@@ -40,6 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import javax.annotation.PostConstruct;
 import javax.inject.Inject;
 import javax.ws.rs.DELETE;
@@ -123,81 +124,192 @@ public class BucketEndpoint extends EndpointBase {
       @QueryParam("acl") String aclMarker,
       @QueryParam("key-marker") String keyMarker,
       @QueryParam("upload-id-marker") String uploadIdMarker,
-      @DefaultValue("1000") @QueryParam("max-uploads") int maxUploads) throws OS3Exception, IOException {
+      @DefaultValue("1000") @QueryParam("max-uploads") int maxUploads) throws Exception {
     long startNanos = Time.monotonicNowNanos();
-    S3GAction s3GAction = S3GAction.GET_BUCKET;
+
+    if (aclMarker != null) {
+      OperationContext op = new OperationContext(S3GAction.GET_ACL, bucketName, startNanos, prefix);
+      Response resp = handleException(() -> handleGetAcl(op), op);
+      if (resp != null) {
+        return resp;
+      }
+    }
+
+    if (uploads != null) {
+      OperationContext op = new OperationContext(S3GAction.LIST_MULTIPART_UPLOAD, bucketName, startNanos, prefix);
+      Response resp = handleException(() -> handleListMultipartUploads(op, keyMarker, uploadIdMarker, maxUploads), op);
+      if (resp != null) {
+        return resp;
+      }
+    }
+
+    OperationContext op = new OperationContext(S3GAction.GET_BUCKET, bucketName, startNanos, prefix);
+    ListObjectsParams params = new ListObjectsParams(delimiter, encodingType, validateMaxKeys(maxKeys), prefix,
+        continueToken, startAfter, marker);
+    Response resp = handleException(() -> handleListObjects(op, params), op);
+    if (resp != null) {
+      return resp;
+    }
+
+    return Response.ok(createEmptyListResponse(bucketName, params)).build();
+  }
+
+  private Response handleGetAcl(OperationContext op) throws OS3Exception, IOException {
+    S3BucketAcl result = getAcl(op.bucketName);
+    getMetrics().updateGetAclSuccessStats(op.getStartNanos());
+    AUDIT.logReadSuccess(
+        buildAuditMessageForSuccess(op.getS3Action(), getAuditParameters()));
+    return Response.ok(result, MediaType.APPLICATION_XML_TYPE).build();
+  }
+
+  private Response handleListMultipartUploads(OperationContext op,
+                                              String keyMarker, String uploadIdMarker,
+                                              int maxUploads)
+      throws OS3Exception, IOException {
+    return listMultipartUploads(op.getBucketName(), op.getPrefix(), keyMarker, uploadIdMarker, maxUploads);
+  }
+
+  private Response handleListObjects(OperationContext op, ListObjectsParams params)
+      throws OS3Exception, IOException {
     PerformanceStringBuilder perf = new PerformanceStringBuilder();
 
-    Iterator<? extends OzoneKey> ozoneKeyIterator = null;
-    ContinueToken decodedToken =
-        ContinueToken.decodeFromString(continueToken);
-    OzoneBucket bucket = null;
+    OzoneBucket bucket = getBucket(op.bucketName);
+    S3Owner.verifyBucketOwnerCondition(headers, op.bucketName, bucket.getOwner());
 
+    validateListObjectsParams(params);
+    final String effectivePrefix = params.getPrefix();
+    final String prevKey = params.getPrevKey();
+
+
+    // If shallow is true, only list immediate children
+    // delimited by OZONE_URI_DELIMITER
+    boolean shallow = listKeysShallowEnabled
+        && OZONE_URI_DELIMITER.equals(params.getDelimiter());
+    Iterator<? extends OzoneKey> keyIterator = bucket.listKeys(effectivePrefix, prevKey, shallow);
+
+    ListObjectResponse response = buildListObjectResponse(keyIterator, op.bucketName, params, bucket);
+
+    int keyCount = response.getCommonPrefixes().size() + response.getContents().size();
+    long opLatencyNs = getMetrics().updateGetBucketSuccessStats(op.startNanos);
+    getMetrics().incListKeyCount(keyCount);
+    perf.appendCount(keyCount);
+    perf.appendOpLatencyNanos(opLatencyNs);
+    AUDIT.logReadSuccess(buildAuditMessageForSuccess(op.s3GAction, getAuditParameters(), perf));
+    response.setKeyCount(keyCount);
+
+    return Response.ok(response).build();
+  }
+
+  private ListObjectResponse buildListObjectResponse(
+      Iterator<? extends OzoneKey> keyIterator, String bucketName,
+      ListObjectsParams params, OzoneBucket bucket) throws OS3Exception {
+
+    final ListObjectResponse response = createEmptyListResponse(bucketName, params);
+    final String prefix = params.getPrefix();
+
+    ListingState state = new ListingState(params.getMaxKeys(), params.getStartAfter());
+    if (params.getContinueToken() != null) {
+      state.setPrevDir(ContinueToken.decodeFromString(params.getContinueToken()).getLastDir());
+    }
+
+    while (keyIterator.hasNext() && !state.isFull()) {
+      OzoneKey next = keyIterator.next();
+      processKey(next, response, state, prefix, params.getDelimiter(), params.getEncodingType(), bucket);
+    }
+
+    if (state.count < state.maxKeys) {
+      response.setTruncated(false);
+    } else if (keyIterator.hasNext() && state.getLastKey() != null) {
+      response.setTruncated(true);
+      ContinueToken nextToken = new ContinueToken(state.getLastKey(), state.getPrevDir());
+      response.setNextToken(nextToken.encodeToString());
+      // Set nextMarker to be lastKey. for the compatibility of aws api v1
+      response.setNextMarker(state.getLastKey());
+    } else {
+      response.setTruncated(false);
+    }
+
+    response.setKeyCount(state.getCount());
+    return response;
+  }
+
+  private Response handleException(Callable<Response> exec, OperationContext op)
+      throws Exception {
     try {
-      if (aclMarker != null) {
-        s3GAction = S3GAction.GET_ACL;
-        S3BucketAcl result = getAcl(bucketName);
-        getMetrics().updateGetAclSuccessStats(startNanos);
-        AUDIT.logReadSuccess(
-            buildAuditMessageForSuccess(s3GAction, getAuditParameters()));
-        return Response.ok(result, MediaType.APPLICATION_XML_TYPE).build();
-      }
-
-      if (uploads != null) {
-        s3GAction = S3GAction.LIST_MULTIPART_UPLOAD;
-        return listMultipartUploads(bucketName, prefix, keyMarker, uploadIdMarker, maxUploads);
-      }
-
-      maxKeys = validateMaxKeys(maxKeys);
-
-      if (prefix == null) {
-        prefix = "";
-      }
-
-      // Assign marker to startAfter. for the compatibility of aws api v1
-      if (startAfter == null && marker != null) {
-        startAfter = marker;
-      }
-
-      // If continuation token and start after both are provided, then we
-      // ignore start After
-      String prevKey = continueToken != null ? decodedToken.getLastKey()
-          : startAfter;
-
-      // If shallow is true, only list immediate children
-      // delimited by OZONE_URI_DELIMITER
-      boolean shallow = listKeysShallowEnabled
-          && OZONE_URI_DELIMITER.equals(delimiter);
-
-      bucket = getBucket(bucketName);
-      S3Owner.verifyBucketOwnerCondition(headers, bucketName, bucket.getOwner());
-
-      ozoneKeyIterator = bucket.listKeys(prefix, prevKey, shallow);
-
+      return exec.call();
     } catch (OMException ex) {
       AUDIT.logReadFailure(
-          buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
-      getMetrics().updateGetBucketFailureStats(startNanos);
+          buildAuditMessageForFailure(op.s3GAction, getAuditParameters(), ex));
+      getMetrics().updateGetBucketFailureStats(op.startNanos);
       if (isAccessDenied(ex)) {
-        throw newError(S3ErrorTable.ACCESS_DENIED, bucketName, ex);
+        throw newError(S3ErrorTable.ACCESS_DENIED, op.bucketName, ex);
       } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
-        // File not found, continue and send normal response with 0 keyCount
-        LOG.debug("Key Not found prefix: {}", prefix);
+        // File not found, continue and send normal response with 0 keyCount and return null
+        LOG.debug("Key Not found prefix: {}", op.prefix);
       } else {
         throw ex;
       }
     } catch (Exception ex) {
-      getMetrics().updateGetBucketFailureStats(startNanos);
+      getMetrics().updateGetBucketFailureStats(op.startNanos);
       AUDIT.logReadFailure(
-          buildAuditMessageForFailure(s3GAction, getAuditParameters(), ex));
+          buildAuditMessageForFailure(op.s3GAction, getAuditParameters(), ex));
       throw ex;
     }
+    return null;
+  }
 
-    // The valid encodingType Values is "url"
-    if (encodingType != null && !encodingType.equals(ENCODING_TYPE)) {
-      throw S3ErrorTable.newError(S3ErrorTable.INVALID_ARGUMENT, encodingType);
+  private void processKey(OzoneKey next, ListObjectResponse response,
+                          ListingState state, String prefix, String delimiter,
+                          String encodingType, OzoneBucket bucket) {
+
+    if (bucket.getBucketLayout().isFileSystemOptimized() &&
+        StringUtils.isNotEmpty(prefix) && !next.getName().startsWith(prefix)) {
+      // prefix has delimiter but key don't have
+      // example prefix: dir1/ key: dir123
+      return;
     }
 
+    if (state.isFirstKey() && Objects.equals(state.getStartAfter(), next.getName())) {
+      state.processedFirstKey();
+      return;
+    }
+
+    String relativeKeyName = next.getName().substring(prefix.length());
+    int depth = StringUtils.countMatches(relativeKeyName, delimiter);
+
+    if (StringUtils.isNotEmpty(delimiter)) {
+      int delimiterIndex = relativeKeyName.indexOf(delimiter);
+      if (depth > 0) {
+        // means key has multiple delimiters in its value.
+        // ex: dir/dir1/dir2, where delimiter is "/" and prefix is dir/
+        String dirName = relativeKeyName.substring(0, delimiterIndex);
+        if (!dirName.equals(state.getPrevDir())) {
+          response.addPrefix(EncodingTypeObject.createNullable(
+              prefix + dirName + delimiter, encodingType));
+          state.setPrevDir(dirName);
+          state.incrementCount();
+        }
+      } else if (relativeKeyName.endsWith(delimiter)) {
+        // means or key is same as prefix with delimiter at end and ends with
+        // delimiter. ex: dir/, where prefix is dir and delimiter is /
+        response.addPrefix(
+            EncodingTypeObject.createNullable(relativeKeyName, encodingType));
+        state.incrementCount();
+      } else {
+        // means our key is matched with prefix if prefix is given and it
+        // does not have any common prefix.
+        addKey(response, next);
+        state.incrementCount();
+      }
+    } else {
+      addKey(response, next);
+      state.incrementCount();
+    }
+
+    state.setLastKey(next.getName());
+  }
+
+  private ListObjectResponse createEmptyListResponse(String bucketName, ListObjectsParams params) {
     // If you specify the encoding-type request parameter,should return
     // encoded key name values in the following response elements:
     //   Delimiter, Prefix, Key, and StartAfter.
@@ -208,100 +320,18 @@ public class BucketEndpoint extends EndpointBase {
     //
     ListObjectResponse response = new ListObjectResponse();
     response.setDelimiter(
-        EncodingTypeObject.createNullable(delimiter, encodingType));
+        EncodingTypeObject.createNullable(params.getDelimiter(), params.getEncodingType()));
     response.setName(bucketName);
-    response.setPrefix(EncodingTypeObject.createNullable(prefix, encodingType));
-    response.setMarker(marker == null ? "" : marker);
-    response.setMaxKeys(maxKeys);
-    response.setEncodingType(encodingType);
+    response.setPrefix(EncodingTypeObject.createNullable(params.getPrefix(), params.getEncodingType()));
+    response.setMarker(params.getMarker() == null ? "" : params.getMarker());
+    response.setMaxKeys(params.getMaxKeys());
+    response.setEncodingType(params.getEncodingType());
     response.setTruncated(false);
-    response.setContinueToken(continueToken);
+    response.setContinueToken(params.getContinueToken());
     response.setStartAfter(
-        EncodingTypeObject.createNullable(startAfter, encodingType));
-
-    String prevDir = null;
-    if (continueToken != null) {
-      prevDir = decodedToken.getLastDir();
-    }
-    String lastKey = null;
-    int count = 0;
-    if (maxKeys > 0) {
-      while (ozoneKeyIterator != null && ozoneKeyIterator.hasNext()) {
-        OzoneKey next = ozoneKeyIterator.next();
-        if (bucket != null && bucket.getBucketLayout().isFileSystemOptimized() &&
-            StringUtils.isNotEmpty(prefix) &&
-            !next.getName().startsWith(prefix)) {
-          // prefix has delimiter but key don't have
-          // example prefix: dir1/ key: dir123
-          continue;
-        }
-        if (startAfter != null && count == 0 && Objects.equals(startAfter, next.getName())) {
-          continue;
-        }
-        String relativeKeyName = next.getName().substring(prefix.length());
-
-        int depth = StringUtils.countMatches(relativeKeyName, delimiter);
-        if (!StringUtils.isEmpty(delimiter)) {
-          if (depth > 0) {
-            // means key has multiple delimiters in its value.
-            // ex: dir/dir1/dir2, where delimiter is "/" and prefix is dir/
-            String dirName = relativeKeyName.substring(0, relativeKeyName
-                .indexOf(delimiter));
-            if (!dirName.equals(prevDir)) {
-              response.addPrefix(EncodingTypeObject.createNullable(
-                  prefix + dirName + delimiter, encodingType));
-              prevDir = dirName;
-              count++;
-            }
-          } else if (relativeKeyName.endsWith(delimiter)) {
-            // means or key is same as prefix with delimiter at end and ends with
-            // delimiter. ex: dir/, where prefix is dir and delimiter is /
-            response.addPrefix(
-                EncodingTypeObject.createNullable(relativeKeyName, encodingType));
-            count++;
-          } else {
-            // means our key is matched with prefix if prefix is given and it
-            // does not have any common prefix.
-            addKey(response, next);
-            count++;
-          }
-        } else {
-          addKey(response, next);
-          count++;
-        }
-
-        if (count == maxKeys) {
-          lastKey = next.getName();
-          break;
-        }
-      }
-    }
-
-    response.setKeyCount(count);
-
-    if (count < maxKeys) {
-      response.setTruncated(false);
-    } else if (ozoneKeyIterator.hasNext() && lastKey != null) {
-      response.setTruncated(true);
-      ContinueToken nextToken = new ContinueToken(lastKey, prevDir);
-      response.setNextToken(nextToken.encodeToString());
-      // Set nextMarker to be lastKey. for the compatibility of aws api v1
-      response.setNextMarker(lastKey);
-    } else {
-      response.setTruncated(false);
-    }
-
-    int keyCount =
-        response.getCommonPrefixes().size() + response.getContents().size();
-    long opLatencyNs =
-        getMetrics().updateGetBucketSuccessStats(startNanos);
-    getMetrics().incListKeyCount(keyCount);
-    perf.appendCount(keyCount);
-    perf.appendOpLatencyNanos(opLatencyNs);
-    AUDIT.logReadSuccess(buildAuditMessageForSuccess(s3GAction,
-        getAuditParameters(), perf));
-    response.setKeyCount(keyCount);
-    return Response.ok(response).build();
+        EncodingTypeObject.createNullable(params.getStartAfter(), params.getEncodingType()));
+    response.setContinueToken(params.getContinueToken());
+    return response;
   }
 
   private int validateMaxKeys(int maxKeys) throws OS3Exception {
@@ -310,6 +340,13 @@ public class BucketEndpoint extends EndpointBase {
     }
 
     return Math.min(maxKeys, maxKeysLimit);
+  }
+
+  private void validateListObjectsParams(ListObjectsParams params) throws OS3Exception {
+    // The valid encodingType Values is "url"
+    if (params.getEncodingType() != null && !params.getEncodingType().equals(ENCODING_TYPE)) {
+      throw S3ErrorTable.newError(S3ErrorTable.INVALID_ARGUMENT, params.getEncodingType());
+    }
   }
 
   @PUT
@@ -690,6 +727,171 @@ public class BucketEndpoint extends EndpointBase {
     }
     getMetrics().updatePutAclSuccessStats(startNanos);
     return Response.status(HttpStatus.SC_OK).build();
+  }
+
+  private static final class OperationContext {
+    private final S3GAction s3GAction;
+    private final String bucketName;
+    private final long startNanos;
+    private final String prefix;
+
+    OperationContext(S3GAction s3GAction, String bucketName, long startNanos, String prefix) {
+      this.s3GAction = s3GAction;
+      this.bucketName = bucketName;
+      this.startNanos = startNanos;
+      this.prefix = prefix;
+    }
+
+    private S3GAction getS3Action() {
+      return s3GAction;
+    }
+
+    private String getBucketName() {
+      return bucketName;
+    }
+
+    private long getStartNanos() {
+      return startNanos;
+    }
+
+    private String getPrefix() {
+      if (prefix == null) {
+        return "";
+      }
+      return prefix;
+    }
+  }
+
+  private static final class ListObjectsParams {
+    private final String delimiter;
+    private final String encodingType;
+    private final int maxKeys;
+    private final String prefix;
+    private final String continueToken;
+    private final String startAfter;
+    private final String marker;
+
+    ListObjectsParams(String delimiter, String encodingType, int maxKeys,
+                      String prefix, String continueToken, String startAfter,
+                      String marker) {
+      this.delimiter = delimiter;
+      this.encodingType = encodingType;
+      this.maxKeys = maxKeys;
+      this.prefix = prefix;
+      this.continueToken = continueToken;
+      this.startAfter = startAfter;
+      this.marker = marker;
+    }
+
+    public String getDelimiter() {
+      return delimiter;
+    }
+
+    public String getEncodingType() {
+      return encodingType;
+    }
+
+    public int getMaxKeys() {
+      return maxKeys;
+    }
+
+    public String getPrefix() {
+      if (prefix == null) {
+        return "";
+      }
+      return prefix;
+    }
+
+    public String getContinueToken() {
+      return continueToken;
+    }
+
+    public String getStartAfter() {
+      // Assign marker to startAfter. for the compatibility of aws api v1
+      if (startAfter == null && marker != null) {
+        return marker;
+      }
+      return startAfter;
+    }
+
+    public String getPrevKey() throws OS3Exception {
+      ContinueToken decodedToken = ContinueToken.decodeFromString(continueToken);
+      return continueToken != null ? decodedToken.getLastKey()
+            : getEffectiveStartKey();
+    }
+
+    public String getMarker() {
+      return marker;
+    }
+
+    public String getEffectiveStartKey() throws OS3Exception {
+      // If continuation token and start after both are provided, then we
+      // ignore start After
+      if (continueToken != null) {
+        ContinueToken decodedToken = ContinueToken.decodeFromString(continueToken);
+        return decodedToken.getLastKey();
+      }
+
+      if (startAfter != null) {
+        return startAfter;
+      }
+
+      return marker;
+    }
+  }
+
+  private static class ListingState {
+    private final int maxKeys;
+    private final String startAfter;
+    private int count = 0;
+    private String prevDir;
+    private String lastKey;
+    private boolean isFirstKey = true;
+
+    ListingState(int maxKeys, String startAfter) {
+      this.maxKeys = maxKeys;
+      this.startAfter = startAfter;
+    }
+
+    void incrementCount() {
+      this.count++;
+    }
+
+    boolean isFull() {
+      return count >= maxKeys;
+    }
+
+    void processedFirstKey() {
+      this.isFirstKey = false;
+    }
+
+    int getCount() {
+      return count;
+    }
+
+    String getPrevDir() {
+      return prevDir;
+    }
+
+    void setPrevDir(String prevDir) {
+      this.prevDir = prevDir;
+    }
+
+    String getLastKey() {
+      return lastKey;
+    }
+
+    void setLastKey(String lastKey) {
+      this.lastKey = lastKey;
+    }
+
+    String getStartAfter() {
+      return startAfter;
+    }
+
+    boolean isFirstKey() {
+      return isFirstKey;
+    }
   }
 
   /**
